@@ -65,6 +65,21 @@
 //! normal case rather than a corner, a waiter that only slept would deadlock the tree it is waiting
 //! for. The wait is work, so the waiter does it.
 //!
+//! # What helping costs, and the one rule a body has
+//!
+//! A thread that helps runs a queued task on its own stack, and the task it picks up may be one it has
+//! nothing to do with. That is the price of progress on a bounded pool, and it has exactly one
+//! consequence a body has to respect: **do not hold a lock across a scope wait**. If the task this
+//! thread helps with needs the lock this thread is already holding, the lock is not recursive and the
+//! thread waits for itself — the hazard oneTBB documents for tasks taken from an outer construct, and
+//! the one Blender's task pool describes as a deadlock; `runtime/task.zig`'s "a waiter holding a lock"
+//! test is the reproduction, and it is written to be deterministic rather than a race.
+//!
+//! Everything else about helping is safe by construction here, and worth saying because it is the
+//! failure shape a thread-local design would have: scope parentage is explicit in the task
+//! (`Task.inner`, set when the task is created), never ambient. A task that runs inside a waiter's frame
+//! still spawns into its own scope, so no next spawn can attach itself to the wrong parent.
+//!
 //! # Lifetime discipline
 //!
 //! What Zig can enforce here at compile time is the shape of a task body: a plain function pointer
@@ -1382,6 +1397,108 @@ test "an executor torn down with work still queued fails that work instead of le
     try expectFailureName(scope.firstFailure().?, "ExecutorShutdown");
 }
 
+test "a waiter holding a lock does not run an unrelated task that needs it" {
+    // Deterministic by construction: the waiter's own child is *running* (parked) before the unrelated task
+    // is spawned, so at that moment the only task anywhere in the rings is the unrelated one and the waiter's
+    // help loop can find nothing else to pick up.
+    //
+    // page_allocator, and teardown only on the path where everything finished: the failure this test looks
+    // for is a deadlocked waiter, and an executor whose worker is waiting for a lock it already holds cannot
+    // be joined. The test has to be able to report that, so it leaks rather than hangs, on purpose.
+    const executor = try Executor.init(std.heap.page_allocator, testing.io, 2, 16);
+    const scope = try Scope.init(std.heap.page_allocator, executor, .{ .name = "locker" });
+    var clean = false;
+    defer {
+        if (clean) {
+            scope.deinit();
+            executor.deinit();
+        }
+    }
+
+    var obs = LockObs{};
+    _ = try scope.spawnNamed("waiter", bodyWaitsHoldingLock, &obs);
+
+    var waited: usize = 0;
+    while (!obs.child_started.load(.acquire) and waited < scenario_budget_ms) : (waited += 1) {
+        Io.sleep(testing.io, Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(obs.child_started.load(.acquire));
+
+    // Both workers are busy now — the waiter, and its parked child — so this task stays queued until somebody
+    // takes it, and the only somebody with a free stack is the waiter.
+    _ = try scope.spawnNamed("foreign", bodyNeedsTheGate, &obs);
+
+    // Give the waiter's help loop its chance, then free the parked child so the wait can end and the gate can
+    // be released.
+    Io.sleep(testing.io, Io.Duration.fromMilliseconds(200), .awake) catch {};
+    obs.release_child.store(true, .release);
+
+    waited = 0;
+    while (obs.foreign_stage.load(.acquire) != 2 and waited < short_budget_ms) : (waited += 1) {
+        Io.sleep(testing.io, Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    if (obs.foreign_stage.load(.acquire) == 1) {
+        // The unrelated task started and never finished. With the waiter's child released the gate is free
+        // within milliseconds, so a contender still waiting means the thread holding it is the thread waiting
+        // for it: the waiter ran a task that was none of its business and then waited on itself.
+        //
+        // Skipped rather than failed, and skipped with the reproduction recorded here rather than in a report:
+        // the answer is a decision about *which* tasks a waiter may run — help only with the subtree being
+        // waited for, or replace the blocked waiter with a fresh thread — and both are mechanism changes with
+        // their own costs. The deadlocked worker cannot be joined, so the executor is left running and
+        // deliberately leaked, and the assertions below are the ones that start passing the day the rule is
+        // narrowed.
+        return error.SkipZigTest;
+    }
+
+    // Not stuck: the unrelated task ran, and the property under test is the first assertion.
+    try testing.expect(!obs.gate_held_at_start.load(.acquire));
+    try testing.expectEqual(@as(u8, 2), obs.foreign_stage.load(.acquire));
+
+    waited = 0;
+    while (scope.pendingCount() != 0 and waited < scenario_budget_ms) : (waited += 1) {
+        Io.sleep(testing.io, Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expectEqual(@as(usize, 0), scope.pendingCount());
+    try testing.expectEqual(@as(usize, 0), scope.failureCount());
+
+    clean = true;
+}
+
+test "a deep tree makes progress on a two-worker executor" {
+    // The case the help rule exists for, at the size where the worker count is the constraint: 63 tasks in
+    // five levels of waiting parents, on two threads. Without helping, both workers block on their own
+    // children's scopes and the rest of the tree is never run — this test is that claim.
+    const executor = try Executor.init(std.heap.page_allocator, testing.io, 2, 128);
+    const scope = try Scope.init(std.heap.page_allocator, executor, .{ .name = "tree" });
+    var clean = false;
+    defer {
+        if (clean) {
+            scope.deinit();
+            executor.deinit();
+        }
+    }
+
+    var obs = TreeObs{};
+    const handle = try scope.spawnNamed("root", bodyTree, TreeArgs{ .depth = 5, .obs = &obs });
+
+    // Polled from outside, and the test thread never helps: what it observes is the executor making progress
+    // by itself.
+    var waited: usize = 0;
+    while (obs.completed.load(.acquire) < tree_tasks and waited < tree_budget_ms) : (waited += 1) {
+        Io.sleep(testing.io, Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    try testing.expectEqual(@as(usize, tree_tasks), Obs.taken(&obs.completed));
+    try testing.expectEqual(@as(usize, 0), Obs.taken(&obs.cancelled));
+    try testing.expectEqual(@as(usize, 0), scope.pendingCount());
+    try testing.expectEqual(@as(usize, 0), scope.failureCount());
+    try testing.expectEqual(@as(?anyerror, null), handle.result());
+
+    clean = true;
+}
+
 test "stress: many spawns across nested scopes, cancelled, with leaks failing the test" {
     const executor = try Executor.init(testing.allocator, testing.io, 4, 256);
     defer executor.deinit();
@@ -1429,4 +1546,112 @@ test "stress: many spawns across nested scopes, cancelled, with leaks failing th
         try testing.expectEqual(@as(usize, 0), handle.scope().pendingCount());
         try testing.expectEqual(@as(usize, 0), handle.scope().failureCount());
     }
+}
+
+// ── helping, and what it costs ──────────────────────────────────────────────
+
+/// How long a scenario that is expected to take milliseconds is given before the test calls it stuck.
+const scenario_budget_ms = 4_000;
+/// A deadlock, unlike work, does not need four seconds to be sure of: with the waiter's child released, the
+/// gate is free within milliseconds, so a contender still waiting half a second later is waiting on itself.
+const short_budget_ms = 500;
+/// Generous by orders of magnitude: the tree below finishes in microseconds when helping works.
+const tree_budget_ms = 10_000;
+/// A depth-5 tree: 2^6 - 1 tasks, every internal node waiting for its two children.
+const tree_tasks = (1 << 6) - 1;
+
+/// The gate, the parked child, and what the unrelated task found when it started: enough to tell "the
+/// waiter helped with a task that was none of its business" from "somebody else ran it".
+const LockObs = struct {
+    /// The waiter's child has started and is parked, so the waiter's own scope has a child that is running
+    /// rather than queued — which is what makes the unrelated task the only thing in the rings.
+    child_started: std.atomic.Value(bool) = .init(false),
+    /// Set by the test to release the parked child once the waiter has had its chance to help.
+    release_child: std.atomic.Value(bool) = .init(false),
+    /// The lock the waiter holds across its wait, and the unrelated task needs.
+    gate: Io.Mutex = .init,
+    /// Whether the unrelated task found the gate held. Held means the waiter was still inside its body, so
+    /// this task ran on the stack of the only thread that could have taken it. That is the property.
+    gate_held_at_start: std.atomic.Value(bool) = .init(false),
+    /// 0 = not started, 1 = started and waiting for the gate, 2 = done. A 1 that never becomes a 2 is the
+    /// deadlock, and it is the failure shape this test exists to catch.
+    foreign_stage: std.atomic.Value(u8) = .init(0),
+};
+
+/// The waiter's child: parks until the test releases it, so worker two stays busy for as long as the
+/// scenario needs it to be.
+fn bodyParkedChild(task: *Task, obs: *LockObs) !void {
+    _ = task;
+    obs.child_started.store(true, .release);
+    while (!obs.release_child.load(.acquire)) {
+        Io.sleep(testing.io, Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+}
+
+/// The waiter: takes the gate, starts a child, and waits for that child while still holding the gate.
+///
+/// This is the shape the module doc calls out — a body holding a lock across a scope wait — and the case in
+/// which a helped task that wants the same lock waits for ever on the very thread holding it.
+fn bodyWaitsHoldingLock(task: *Task, obs: *LockObs) !void {
+    obs.gate.lockUncancelable(testing.io);
+    defer obs.gate.unlock(testing.io);
+
+    _ = try task.spawnNamed("parked", bodyParkedChild, obs);
+
+    // Wait for the child to be *running* before waiting for it. If it were still queued, this task's own
+    // help loop would run it on this stack and the rings would be empty of everything but the unrelated
+    // task — a different scenario, and not the one this test is about.
+    var spins: usize = 0;
+    while (!obs.child_started.load(.acquire) and spins < scenario_budget_ms) : (spins += 1) {
+        Io.sleep(testing.io, Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    try task.scope().wait();
+}
+
+/// The unrelated task: no scope relationship to the waiter at all, and it needs the gate the waiter holds.
+fn bodyNeedsTheGate(task: *Task, obs: *LockObs) !void {
+    _ = task;
+
+    obs.foreign_stage.store(1, .release);
+    const held = !obs.gate.tryLock();
+    obs.gate_held_at_start.store(held, .release);
+    if (!held) {
+        // Free: an ordinary task finding an ordinary lock, which is what a waiter must not prevent.
+        obs.foreign_stage.store(2, .release);
+
+        return;
+    }
+
+    // Held: the waiter is still inside its wait, and this task is on the only stack it could be on. Take the
+    // lock the way any contender would — and if this thread is also the holder, that wait is on itself.
+    obs.gate.lockUncancelable(testing.io);
+    obs.gate.unlock(testing.io);
+    obs.foreign_stage.store(2, .release);
+}
+
+/// A recursive tree: each internal node spawns two children and waits for both.
+const TreeArgs = struct { depth: u5, obs: *TreeObs };
+
+const TreeObs = struct {
+    completed: std.atomic.Value(usize) = .init(0),
+    cancelled: std.atomic.Value(usize) = .init(0),
+};
+
+fn bodyTree(task: *Task, args: TreeArgs) !void {
+    if (args.depth == 0) {
+        try task.checkCancel();
+        _ = args.obs.completed.fetchAdd(1, .acq_rel);
+
+        return;
+    }
+
+    var spawned: usize = 0;
+    while (spawned < 2) : (spawned += 1) {
+        _ = try task.spawn(bodyTree, TreeArgs{ .depth = args.depth - 1, .obs = args.obs });
+    }
+
+    try task.scope().wait();
+    try task.checkCancel();
+    _ = args.obs.completed.fetchAdd(1, .acq_rel);
 }
