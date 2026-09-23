@@ -64,7 +64,10 @@ pub const Transport = struct {
             // The chain the context loaded, or the single certificate it was built with: a context assembled
             // by hand (a test fixture) has no chain to speak of, and a session that is handed none would
             // present an empty Certificate message.
-            .tls = session.Session.init(if (ctx.certificate_chain.len > 0) ctx.certificate_chain else &.{ctx.cert_der}, ctx.signing_key, ctx.alpn),
+            // The same trap `Context.handshakeOptions` documents: `&.{ctx.cert_der}` here would be
+            // an array constructed in this frame, and `Session.init` keeps the slice — so the
+            // session would read a chain whose storage died with this call.
+            .tls = session.Session.init(if (ctx.certificate_chain.len > 0) ctx.certificate_chain else ctx.singleCertChain(), ctx.signing_key, ctx.alpn),
             .ep_data = @intCast(fd),
         };
     }

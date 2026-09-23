@@ -103,6 +103,17 @@ pub const Context = struct {
     chain_pool: []u8 = &.{},
     /// Storage for the chain's entries, owned (freed by deinit).
     chain_entries: [][]const u8 = &.{},
+    /// Scratch for the one-entry chain view `handshakeOptions` hands the handshake when
+    /// `certificate_chain` is empty — the hand-built-Context case above, where `cert_der` stands
+    /// in for the chain.
+    ///
+    /// It lives here because it must outlive the call that builds it: this used to be
+    /// `&.{self.cert_der}`, an array constructed as a temporary in `handshakeOptions`, so the
+    /// slice outlived the frame that owned it and the handshake read a garbage length out of it
+    /// (in Debug, the `0xAAAAAAAAAAAAAAAA` fill). The write is idempotent — same pointer, same
+    /// length, every connection — so concurrent connections racing to fill it write the same
+    /// value; the field is a cache, which is why the writer below reaches it through `*const`.
+    single_chain: [1][]const u8 = undefined,
     /// The signing identity matching the certificate's key type (ECDSA P-256, Ed25519, or RSA).
     signing_key: SigningKey,
     alpn: []const Alpn,
@@ -213,8 +224,10 @@ pub const Context = struct {
     /// per connection), the context supplies the cert / key / alpn / curve policy. The salt is only
     /// consumed by an RSA signing key, the ECDSA / Ed25519 paths ignore it.
     pub fn handshakeOptions(self: *const Context, ephemeral_secret: [32]u8, server_random: [32]u8, pss_salt: [rsa.pss_salt_len]u8) HandshakeOptions {
+        if (self.certificate_chain.len == 0) @constCast(self).single_chain[0] = self.cert_der;
+
         return .{
-            .certificate_chain = if (self.certificate_chain.len > 0) self.certificate_chain else &.{self.cert_der},
+            .certificate_chain = if (self.certificate_chain.len > 0) self.certificate_chain else &self.single_chain,
             .signing_key = self.signing_key,
             .ephemeral_secret = ephemeral_secret,
             .server_random = server_random,
@@ -222,6 +235,15 @@ pub const Context = struct {
             .alpn_prefs = self.alpn,
             .group_prefs = self.curves,
         };
+    }
+
+    /// The chain to present, storing a one-entry view first when only `cert_der` is set. For
+    /// callers that need the slice outside a handshake and cannot use `handshakeOptions`.
+    pub fn singleCertChain(self: *const Context) []const []const u8 {
+        if (self.certificate_chain.len > 0) return self.certificate_chain;
+        @constCast(self).single_chain[0] = self.cert_der;
+
+        return &self.single_chain;
     }
 
     /// Whether the TLS 1.3 path is offered under this policy (ceiling reaches 1.3).
