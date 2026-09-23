@@ -39,6 +39,18 @@ third name referred to is retired — `decisions.md` D1). Rules:
 5. **No blocking.** Loop-thread code must not perform blocking syscalls, mutex
    waits, or unbounded computation. Anything that can wait runs in the async
    lane or moves to a worker role.
+6. **Scopes own their tasks.** `zurtr.runtime.task`: a `Scope` owns the tasks
+   spawned in it, and `end` cancels and waits for every child before it returns;
+   a task's own scope is reaped the same way when its body returns, so nothing
+   outlives the scope that spawned it. Parentage is explicit at spawn
+   (`Task.inner`, never ambient), so a task running inside another task's frame
+   still spawns into its own scope. Cancellation is one flag read up the parent
+   chain and observed cooperatively (`Task.checkCancel` for native code,
+   `Task.scriptInterrupt` for zscript's interrupt callback) — nothing preempts
+   native code — and a failure goes to the scope's `FailurePolicy`, never
+   swallowed. A thread waiting for a scope helps by running queued work, which
+   may be work that is not its own: a body must not hold a lock across a scope
+   wait, and `runtime/task.zig`'s waiter-and-lock test reproduces that cost.
 
 ## 2. Ownership and lifetimes
 
