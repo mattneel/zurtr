@@ -20,6 +20,7 @@ pub const runtime = struct {
     /// Bounded lock-free multi-producer multi-consumer queue: the substrate under per-worker queues,
     /// work stealing, and cross-worker completion delivery.
     pub const mpmc = @import("runtime/mpmc.zig");
+    pub const task = @import("runtime/task.zig");
 };
 
 /// Live UI: session state, events, render/patch, protocol.
@@ -27,6 +28,16 @@ pub const live = struct {
     pub const protocol = @import("live/protocol.zig");
     /// The worker's bus: sessions subscribe to topics, committed writes publish to them.
     pub const pubsub = @import("live/pubsub.zig");
+};
+
+/// Domain: resources, typed actions, validation, authorization, relationships.
+///
+/// The code lives in `src/domain/`; this export is what makes it reachable, and what makes the module
+/// inventory below agree with the tree.
+pub const domain = struct {
+    pub const action = @import("domain/action.zig");
+    pub const policy = @import("domain/policy.zig");
+    pub const validation = @import("domain/validation.zig");
 };
 
 /// Script: the QuickJS seam. Behavior the host can replace without a native rebuild.
@@ -47,6 +58,13 @@ pub const zeex = if (@import("build_options").script) @import("zeex/compile.zig"
 /// (`Value`, `Tier`, `Database`, `Tx`) do not, so a build that never asks for an adapter never pays
 /// for one.
 pub const data = @import("data/root.zig");
+
+/// Jobs: durable queues, schedules, retries, concurrency, cancellation.
+///
+/// The queue needs the data contract's types and nothing else — the adapter that stores it is chosen by
+/// the application — so a build without one still compiles this module. Its database-backed tests are
+/// compiled only when the adapter is built, because that is when there is a binding to test against.
+pub const jobs = @import("jobs/root.zig");
 
 /// What this build contains, for `zurtr modules` and `zurtr build --report`.
 ///
@@ -71,8 +89,8 @@ pub const modules = [_]Module{
     .{ .name = "runtime", .state = .implemented, .surface = "pool" },
     .{ .name = "live", .state = .implemented, .surface = "protocol" },
     .{ .name = "data", .state = .implemented, .surface = "contract + Turso adapter (memory, file, sync, distributed)" },
-    .{ .name = "domain", .state = .declared, .surface = "resources, typed actions, validation, authorization" },
-    .{ .name = "jobs", .state = .declared, .surface = "durable queues, schedules, retries, cancellation" },
+    .{ .name = "domain", .state = .implemented, .surface = "resources, typed actions, validation, authorization" },
+    .{ .name = "jobs", .state = .implemented, .surface = "durable queue, schedules, retries, cancellation" },
     .{ .name = "agents", .state = .declared, .surface = "signals, decisions, effects, checkpoints" },
     .{ .name = "app", .state = .declared, .surface = "config, routes, middleware, auth, lifecycle" },
     .{ .name = "dev", .state = .declared, .surface = "incremental builds, reload, diagnostics, tests" },
@@ -85,8 +103,11 @@ test "zurtr module builds and links the transport" {
 test {
     _ = runtime.pool;
     _ = runtime.mpmc;
+    _ = runtime.task;
     _ = live.protocol;
     _ = live.pubsub;
     _ = data;
+    _ = domain;
+    _ = jobs;
     if (comptime @import("build_options").script) _ = zeex;
 }
