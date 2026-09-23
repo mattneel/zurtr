@@ -182,9 +182,11 @@ test "a transaction reads its own uncommitted writes" {
 }
 
 test "a transaction's handle is released by the adapter, not by the allocator it came from" {
-    // Deliberately *not* an arena: a `Tx` the adapter forgets to release is invisible to a test that
-    // frees everything at once at the end, and a transaction is the one allocation this layer makes on
-    // every write path. `std.testing.allocator` is the only witness that notices.
+    // Deliberately *not* an arena, unlike the rest of this file: a `Tx` the adapter forgets to release
+    // is invisible to a test that frees everything at once at the end, and a transaction is the one
+    // allocation this layer makes on every write path. `std.testing.allocator` is the only witness that
+    // notices — and switching this back to the arena the other tests use would not be a simplification,
+    // it would be deleting the test: the arena frees exactly what the adapter did not.
     var db = try adapter.open(std.testing.allocator, std.testing.io, .memory);
     defer db.close();
 
