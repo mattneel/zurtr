@@ -5,6 +5,12 @@ the typed event pipeline, the render representation, patch generation, and the
 client protocol. It does not import `domain`; the binding of events to domain
 actions lives in `app`.
 
+Status: the wire codec (`src/live/protocol.zig`), the render tree
+(`src/live/tree.zig`), the patcher (`src/live/patch.zig`) and the worker's bus
+(`src/live/pubsub.zig`) are implemented. The session lifecycle below — attach,
+resume, terminate, backpressure, the `app` binding — is contract only: there is
+no session type in the tree yet.
+
 ## Session lifecycle
 
 1. **Initial render.** An HTTP request handled by `app` builds a `live.Session`

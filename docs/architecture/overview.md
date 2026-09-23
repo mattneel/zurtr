@@ -1,35 +1,47 @@
 # zurtr — architecture overview
 
-Status: initial design, 2026-09-22. This document is normative for module
-boundaries and execution semantics; per-module contracts live in
-`contracts.md` and `modules/`.
+Status: initial design, 2026-09-22; the transport and module inventory were
+revised 2026-09-23 for the swap from the vendored swerver to the vendored zix
+(`deps/zix`). This document is normative for module boundaries and execution
+semantics; per-module contracts live in `contracts.md` and `modules/`.
 
 ## What zurtr is
 
-A native application framework in Zig on top of the vendored swerver transport
-(`deps/swerver`, pinned; see `deps/swerver/UPSTREAM.md`). It provides stateful
-server-rendered interfaces (Live UI), typed domain actions (Domain), durable
-background work (Jobs), agent workflows (Agents), persistence (Data), the
-application assembly layer (Application), and a development loop (Development).
-Applications are ordinary Zig and deploy as one static executable.
+A native application framework in Zig on top of the vendored zix transport
+(`deps/zix`, pinned; see `deps/zix/UPSTREAM.md`) — HTTP/1.1 and HTTP/3 on one
+origin, WebTransport, and zix's own in-tree drivers (`postgrez`, `rediz`,
+`prometheuz`). It provides stateful server-rendered interfaces (Live UI), typed
+domain actions (Domain), durable background work (Jobs), agent workflows
+(Agents), persistence (Data), the application assembly layer (Application), and
+a development loop (Development). Applications are ordinary Zig and deploy as
+one static executable.
 
 ## Modules and dependency direction
 
-| Module | Responsibility | May import |
-| --- | --- | --- |
-| `runtime` (shared core) | Ownership helpers, arenas, ids, clock, error taxonomy, message types | swerver |
-| `data` | Queries, transactions, migrations, adapters | runtime, swerver |
-| `domain` | Resources, typed actions, validation, authorization, relationships | data, runtime |
-| `live` | Session state, events, components, render/patch, DOM protocol | runtime, swerver |
-| `jobs` | Durable queues, schedules, retries, concurrency, cancellation | data, domain (action refs), runtime |
-| `agents` | Signals, decisions, effects, checkpoints, durable execution | data, domain, jobs, runtime |
-| `app` | Config, routes, middleware, auth, lifecycle, telemetry; wires the rest | all of the above |
-| `dev` | Incremental builds, reload, diagnostics, tests, inspection | build system; not linked into release apps |
+| Module | Responsibility | May import | Status |
+| --- | --- | --- | --- |
+| `runtime` (shared core) | Worker pool with work stealing and completion delivery, a bounded lock-free MPMC queue, a structured-task layer | zix | implemented: `src/runtime/` |
+| `data` | Queries, transactions, migrations, adapters | runtime, zix | implemented: the contract plus the Turso adapter at four tiers (`docs/modules/data.md`) |
+| `domain` | Resources, typed actions, validation, authorization, relationships | data, runtime | declared; `src/domain/{action,policy,validation}.zig` is in the tree but is not exported by `src/root.zig` |
+| `live` | Session state, events, components, render/patch, DOM protocol | runtime, zix | implemented: `src/live/{protocol,pubsub,tree,patch}.zig` |
+| `jobs` | Durable queues, schedules, retries, concurrency, cancellation | data, domain (action refs), runtime | declared |
+| `agents` | Signals, decisions, effects, checkpoints, durable execution | data, domain, jobs, runtime | declared |
+| `app` | Config, routes, middleware, auth, lifecycle, telemetry; wires the rest | all of the above | declared |
+| `dev` | Incremental builds, reload, diagnostics, tests, inspection | build system; not linked into release apps | declared |
 
-Optional layer: `script` (QuickJS-ng, `docs/modules/script.md`) sits beside the modules rather than in
-the dependency order — nothing below it depends on it, and everything above it can. Behavior a host can
-replace without a native rebuild; the authority a script can reach is exactly the host functions the host
-registered.
+The status column mirrors the `modules` table in `src/root.zig`, which is the
+tree's own inventory (`zurtr modules` prints it). *Declared* means this tree has
+the contract and no implementation; a module moves to *implemented* when its
+first real surface lands.
+
+Optional layers: `script` (QuickJS-ng, `docs/modules/script.md`) and `zeex`
+(JSX lowered to Zig at build time by a script the build runs, `src/zeex/`) sit
+beside the modules rather than in the dependency order — nothing below them
+depends on them, and everything above them can. `script` is behavior a host can
+replace without a native rebuild, and the authority a script can reach is exactly
+the host functions the host registered; `zeex` is a build-time lowering that
+leaves nothing of itself in the running program. Both are behind build options
+(`-Dscript`, which `zeex` needs): the base build contains neither.
 
 Dependency rule: arrows point downward only. `live` core never imports `domain`;
 the *glue* that binds live events to domain actions lives in `app` (a small
@@ -51,14 +63,22 @@ generic type parameterized by the whole application:
 
 ## Execution model
 
-Transport (swerver): one event loop per worker process, N workers via
-`SO_REUSEPORT`, synchronous zero-copy handlers; request slices point into the
-receive buffer and the response body must be produced before the handler
-returns. swerver already has a **park/resume** mechanism (used by its Postgres
-client): a handler returns a park sentinel, the connection parks, and the loop
-resumes it when the operation completes.
+Transport (zix): three dispatch models, chosen in the server config
+(`deps/zix/src/tcp/http1/config.zig`). `.EPOLL` and `.URING` run N
+shared-nothing worker loops, each with its own `SO_REUSEPORT` listener
+(`deps/zix/src/tcp/http1/dispatch/{epoll,uring}.zig`); `.ASYNC` runs the request
+on a fiber over a thread pool (`dispatch/async.zig`). Handlers are synchronous
+and zero-copy in the loop models: request slices point into the receive buffer
+and the response body must be produced before the handler returns. In `.ASYNC`
+the request's `std.Io` is a yielding backend, so a driver round trip parks the
+connection's fiber instead of blocking the worker
+(`deps/zix/src/tcp/http1/context.zig`). zix has no park sentinel: the
+park/resume mechanism this section was written against belonged to swerver,
+which is no longer vendored.
 
-zurtr uses three execution classes:
+zurtr uses three execution classes. **None of them is implemented in this tree
+yet** — the three classes below are the design, and `runtime`'s pool, queue and
+task layer (`src/runtime/`) is the only execution machinery that exists.
 
 1. **Synchronous** — routing, session lookup in memory, validation, render,
    patch generation, fast DB ops via the parked path below. Runs on the reactor
@@ -73,10 +93,12 @@ zurtr uses three execution classes:
    drivers (a job completing, an agent step, a pub/sub broadcast) retains an
    explicit **connection handle**: `{worker_id, conn_index, conn_generation,
    request_id}` plus **owned** response data. Completion is enqueued on the
-   worker's completion queue and signaled via a registered wake fd; the loop
-   drains the queue and, validating the connection generation, writes the
-   response or drops it. A stale handle (connection closed/reused) is a
-   no-op + counter increment, never a use-after-free.
+   worker's completion queue and signaled to the loop (via a registered wake fd
+   in the original design; zix offers no such hook, see
+   `docs/architecture/zix-deferred.md`); the loop drains the queue and,
+   validating the connection generation, writes the response or drops it. A
+   stale handle (connection closed/reused) is a no-op + counter increment, never
+   a use-after-free.
 
 Everything that can be synchronous should be; parks are for single in-flight
 awaitables; deferred handles are for external completions and session fanout.
@@ -103,7 +125,7 @@ mutable state across workers. Consequences, stated plainly:
 | --- | --- |
 | Recoverable error | Ends the operation; the surface decides (HTTP status, job retry, live event error message). May reset the session (`session_reset`) without affecting other sessions. |
 | Session corruption / invariant violation | Session is terminated and marked for resync; the worker keeps serving. |
-| Panic, OOM, memory corruption | Worker process aborts. The master respawns it (`swerver.Master` model). In-flight sessions on that worker are lost and resync on reconnect. |
+| Panic, OOM, memory corruption | The process aborts: zix's workers are threads in one process (`workers` in the server config), and nothing in this tree supervises one. In-flight sessions on that worker are lost and resync on reconnect. |
 | Isolation needed by the app | Run roles as separate supervised processes from the same executable (`zurtr run --role=web|jobs|agents`), so a crash in one role does not take the others down. |
 
 No BEAM-style per-entity preemptive isolation: stateful entities are not
@@ -114,22 +136,28 @@ is therefore a deployment choice (role processes, or one process per shard).
 
 - Every module is a separate Zig module with explicit imports; an application
   compiles only the modules it uses (unreferenced modules are never analyzed).
-- Feature flags map to swerver build options (TLS/HTTP2/HTTP3/proxy/io_uring/
-  compression), all off by default: base build is HTTP/1.1-only with no
-  external dependencies.
+- Build options are the framework's own and all default off: `-Dturso` /
+  `-Dturso-sync` (the data adapter and its sync SDK Kit) and `-Dscript` (the
+  QuickJS layer and the `zeex` compiler that runs on it). zix has no build-time
+  feature flags — its protocols, drivers and dispatch models are in-tree source,
+  selected in configuration at run time — so the base build is the transport
+  plus the framework and needs no external dependency beyond libc.
 - Dev loop (`dev` module): incremental compilation (`-fincremental --watch`),
   process replacement, browser reconnect with session snapshot transfer when
   compatible. Target: handler and component edits reach the browser in <1s,
   measured by a harness, on this workstation.
-- Release: static executable; release pins the exact Zig revision and the
-  swerver revision; `zurtr build --report` emits cold/warm build times, peak
+- Release: static executable; release pins the exact Zig revision
+  (`minimum_zig_version` in `build.zig.zon`) and the zix revision
+  (`deps/zix`); `zurtr build --report` emits cold/warm build times, peak
   RSS, executable size, and the enabled protocol/module inventory.
 - Applications never require Node/npm: the DOM bridge ships as a bundled
   prebuilt asset; optional shared client logic compiles from Zig to WASM.
 
 ## The slice (first integration milestone)
 
-One application exercising the whole architecture:
+One application exercising the whole architecture. **Not built yet:**
+`apps/slice/` holds the specification (`apps/slice/SPEC.md`); the application,
+its migrations and the end-to-end script it names do not exist in this tree.
 
 1. HTTP request renders initial HTML for a live page; the browser opens a live
    connection; a session is created.
@@ -143,12 +171,25 @@ One application exercising the whole architecture:
    the latency target.
 
 Each numbered item is an acceptance check in the slice's end-to-end script.
+Storage: the slice is specified against PostgreSQL (`apps/slice/SPEC.md` —
+`bigserial`, `timestamptz`, `bytea`), while the tree's only built adapter is
+Turso, which is SQLite-compatible; the two do not agree yet.
 
 ## Deferred / explicitly out of scope
 
-- Pure-Zig TLS (the documented TLS path requires OpenSSL; a pure-Zig stack
-  needs separate engineering and security validation).
-- Non-PostgreSQL adapters: the adapter interface is designed, only PostgreSQL
-  is implemented.
+- Pure-Zig TLS as zurtr's own work: zix carries a Zig TLS implementation
+  (`deps/zix/src/tls/`, wired into its HTTP/1.1 server as `tls_serve`/`tls_mux`),
+  so no OpenSSL is required for HTTPS. zurtr's own TLS surface (config,
+  certificates, deployment) is unbuilt.
+- Parked and deferred execution (classes 2 and 3 above): designed, not
+  implemented. zix has no park sentinel to park against, and its HTTP/1.1
+  dispatch exposes no way for another thread to wake the loop
+  (`dispatch/epoll.zig` publishes only `runEpoll`); what zurtr uses instead is
+  an open call.
+- Adapters: Turso is the only built adapter, at four tiers. The PostgreSQL
+  adapter is declared over zix's `postgrez` and is not built
+  (`docs/modules/data.md`).
 - Connection migration of live sessions across workers (see above).
-- HTTP/2 (RFC 8441) WebSockets: HTTP/1.1 upgrade first.
+- HTTP/2 (RFC 8441) WebSockets: HTTP/1.1 upgrade first (zix's own server
+  serves WebSocket over HTTP/1.1; RFC 8441 appears only in zixer's edge bridge,
+  `deps/zix/src/zixer/http2_ws_bridge.zig`).

@@ -5,12 +5,17 @@ authentication, telemetry, and the bridges that wire `domain`, `data`, `live`,
 `jobs`, and `agents` to HTTP and to each other. It is the only module allowed
 to depend on all others.
 
+Status: **declared** — no implementation in this tree (`src/root.zig`'s module
+table). The configuration sketch below names types the tree does not have yet;
+the exceptions are the transport type and the database handle, which are named
+after the real ones (`deps/zix/src/tcp/http1/config.zig`, `src/data/root.zig`).
+
 ## Configuration
 
 ```zig
 pub const Config = struct {
-    server: swerver_config,          // listeners, workers, limits
-    db: data.PgConfig,               // url, pool size, timeouts
+    server: zix.Http1.ServerConfig,  // listeners, workers, limits
+    db: data.Tier,                   // where the data lives: memory|file|sync|distributed
     app: struct { name: []const u8, secret: Secret, base_url: []const u8 },
     live: live.Config,               // queue bounds, idle timeout, snapshot policy
     jobs: jobs.Config,               // queues, lease, backoff, retention
@@ -42,7 +47,8 @@ pub const Config = struct {
 - Middleware: ordered, explicit list (`middleware.Chain` extended with
   authenticated/session/telemetry entries); no implicit global middleware.
 - Static assets: served from a build-produced asset map (hashed names, cache
-  headers, precompressed variants when `swerver-compression` is enabled).
+  headers, precompressed variants when compression is enabled in the server
+  config; brotli and flate are in-tree, `deps/zix/src/utils/compression/`).
 
 ## Authentication and principals
 
@@ -64,9 +70,18 @@ pub const Config = struct {
   no per-surface copies of domain logic.
 - **Pub/sub**: live sessions subscribe to topics
   (`pubsub.subscribe(:invoice, id)`); `app` publishes after committed writes
-  (`pubsub.publish(tx, topic, payload)` → `pg_notify` inside the transaction,
-  delivery after commit). Subscribers receive `Info` messages on the session
-  owner thread.
+  (`pubsub.publish(tx, topic, payload)` → a transactional notification, delivery
+  after commit). Subscribers receive `Info` messages on the session owner
+  thread.
+
+  The tree's bus (`src/live/pubsub.zig`) is the worker-local broker — publish
+  and subscribe, no transaction and no database. The transactional form above
+  has nowhere to go today: the only built adapter is Turso, which is
+  SQLite-compatible and has no `LISTEN`/`NOTIFY`, and zix's `postgrez` driver
+  (which does have it, `deps/zix/src/driver/postgrez/src/notify.zig`) backs no
+  built adapter. The durable substitute is the outbox described in
+  `docs/modules/live.md` and `docs/modules/data.md`; which one `app` uses is
+  unresolved.
 - **Jobs bridge**: `jobs` runs in its role process; the web role enqueues.
   Job completion that must reach a live session is published through pub/sub
   (the slice uses exactly this path).
@@ -83,9 +98,11 @@ pub const Config = struct {
 
 ## Lifecycle and shutdown
 
-- `app.run(allocator, App)` builds the server and runs it; `SIGTERM` drains
-  (swerver's drain path), sessions terminate with a `close` notice, jobs finish
-  their current step and stop leasing.
+- `app.run(allocator, App)` builds the server and runs it; `SIGTERM` drains,
+  sessions terminate with a `close` notice, jobs finish
+  their current step and stop leasing. zix's HTTP/1.1 server has no drain or
+  shutdown entry point in the tree today (`deps/zix/src/tcp/http1/server.zig`),
+  so graceful shutdown is this module's to build.
 - Release builds never start without an applied schema: `zurtr migrate` is a
   separate step; dev mode applies migrations automatically and refuses to start
   if a migration would be destructive (drop/alter type) without

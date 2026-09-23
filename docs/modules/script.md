@@ -5,6 +5,10 @@ Scope: the optional scripting layer. QuickJS-ng through the vendored binding at
 native rebuild. It is a *layer* rather than one of the seven modules: nothing
 below it depends on it, and everything above it can.
 
+Status: implemented behind `-Dscript` (`src/script/root.zig`); the base build
+contains no engine, and the `zeex` template compiler (`src/zeex/compile.zig`) is
+the one caller in the tree — it runs the JSX transform as a build-time script.
+
 ## The boundary
 
 Scripts define behavior; the host defines what behavior is allowed to *reach*.
@@ -65,6 +69,7 @@ pub const Script = struct {
     pub fn load(self: *Script, name: [:0]const u8, source: [:0]const u8, revision: Revision) Error!void;
     pub fn registerHost(self: *Script, comptime func: quickjs.cfunc.Func, name: [:0]const u8, argc: c_int) Error!void;
     pub fn callInt(self: *Script, name: [:0]const u8, argument: i32) Error!i32;
+    pub fn callText(self: *Script, name: [:0]const u8, input: []const u8, allocator: std.mem.Allocator) Error![]u8;
     pub fn errorDetail(self: *const Script) []const u8;
 };
 ```

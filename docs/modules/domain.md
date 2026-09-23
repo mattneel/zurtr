@@ -4,6 +4,14 @@ Scope: resources, typed actions, validation, authorization, relationships.
 The domain is where an application's operations are declared once and reused by
 every surface (HTTP endpoint, live event, job, agent tool).
 
+Status: **declared** in `src/root.zig`'s module table, and nothing imports the
+code that is in the tree: `src/domain/{action,policy,validation}.zig` exists but
+is not exported from `src/root.zig`, so it is not part of the module surface
+this document describes. Two further gaps between this contract and that code:
+the spec shape below shows `validate(input)`, while the code requires
+`Spec.validate(std.mem.Allocator, Input)` (`src/domain/action.zig`), and the
+resource/relationship layer (§Resources) has no file at all.
+
 ## Actions
 
 ```zig

@@ -4,13 +4,19 @@ The slice is the framework's integration test: one small application that
 exercises every module's central promise. It is not a demo — its acceptance is
 machine-checked by `zurtr test --e2e` and the dev-latency harness.
 
+Status: **not implemented** — `apps/slice/` contains this specification and
+nothing else. There is no application source, no `migrations/` directory and no
+e2e script in the tree yet. The one piece that does exist is the browser half of
+the live protocol (`assets/zurtr_live.js`, with its self-test page
+`assets/zurtr_live_test.html`).
+
 ## Application: `tasks`
 
 A single live page where an authenticated user creates tasks; creating a task
 durably enqueues a summarization job; the job's result appears on the page
 without a reload.
 
-### Schema (apps/slice/migrations/0001_init.sql)
+### Schema (planned: `apps/slice/migrations/0001_init.sql`, not in the tree)
 
 ```sql
 create table users (
@@ -18,7 +24,6 @@ create table users (
   username   text not null unique,
   created_at timestamptz not null default now()
 );
-
 create table tasks (
   id         bigserial primary key,
   user_id    bigint not null references users(id),
@@ -33,6 +38,13 @@ create table summaries (
 );
 -- plus the framework's tables (zurtr_jobs, zurtr_schema_migrations)
 ```
+
+Dialect: this schema is PostgreSQL (`bigserial`, `timestamptz`, `bytea` in the
+tables below), and so are the `createdb` bootstrap and the `NOTIFY`-based wakeups
+the acceptance checks assume. The tree's only built adapter is Turso, which is
+SQLite-compatible (`src/data/turso_adapter.zig`, `docs/modules/data.md`), so
+either the slice moves to that dialect or the PostgreSQL adapter gets built —
+that choice has not been made.
 
 ### Domain
 
@@ -60,8 +72,9 @@ create table summaries (
 
 - `GET /tasks` → live page (initial HTML, session token).
 - `GET /zurtr/live` → WebSocket endpoint (the live transport).
-- `POST /zurtr/upload` → session-scoped upload endpoint (implemented, exercised
-  by a client-side test only).
+- `POST /zurtr/upload` → session-scoped upload endpoint (server side planned;
+  the browser half is in `assets/zurtr_live.js`, which posts to
+  `/zurtr/upload?token=…`, and its self-test page exercises it).
 - `GET /login?as=<username>` (dev-only, `--dev` flag) → sets the signed session
   cookie for a seeded user; refused in release builds.
 - `GET /healthz` → `200 ok`.

@@ -4,6 +4,10 @@ Scope: stateful workflows with durable execution — typed signals, decisions,
 effects, checkpoints. Agents reuse `jobs` (execution) and `domain` (actions as
 tools); they add durable state and replay with recorded effects.
 
+Status: **declared** — no implementation in this tree (`src/root.zig`'s module
+table). The tables below are PostgreSQL-shaped, like `jobs.md`'s, and share its
+open question about the storage the framework actually has (`docs/modules/data.md`).
+
 ## Model
 
 An agent is a declaration:
@@ -100,17 +104,19 @@ create table zurtr_agent_signals (
 The model above deliberately says nothing about *how* a `Decision` is reached. Three things fill that in,
 and none of them changes the loop:
 
-- **Decisions from a model.** `ai.zig` (the stack's AI SDK implementation: `generateText`, `streamText`,
-  multi-step tool loops, `ToolLoopAgent`) produces exactly the shapes this contract already names: a tool
-  call is `Decision.call`, a clarifying turn is `Decision.ask`, a final answer is `Decision.done`. The
+- **Decisions from a model.** The stack's sibling `ai.zig` package — an AI SDK implementation, not a
+  file in this repository — produces exactly the shapes this contract already names: its
+  `generateText`, `streamText`, multi-step tool loops and `ToolLoopAgent` land on a tool call that is
+  `Decision.call`, a clarifying turn that is `Decision.ask`, and a final answer that is
+  `Decision.done`. The
   agent's tools *are* `domain` actions, so authorization, validation and transaction rules are the same
   ones an HTTP request goes through. Provider choice, credentials and prompt assembly belong to the
   application; this module records what was decided, not how.
 - **Decisions from a script.** `zurtr.script` may define `decide`/`apply` instead of Zig. What makes that
-  workable is the same thing that makes jzs's agent addons workable: the durable surface is exposed as
-  host functions — `emit`, `checkpoint`, `sleep`, `cancelRequested` — and the run's state is readable and
-  writable through `state.get/set/del/list`. A script cannot reach the database, the network or the
-  clock on its own; it reaches the host, and the host does the durable thing.
+  workable is the same thing that makes the sibling `jzs` package's agent addons workable: the durable
+  surface is exposed as host functions — `emit`, `checkpoint`, `sleep`, `cancelRequested` — and the run's
+  state is readable and writable through `state.get/set/del/list`. A script cannot reach the database, the
+  network or the clock on its own; it reaches the host, and the host does the durable thing.
 - **State is outside the JavaScript heap.** The run's state lives in this module's tables through
   `zurtr.data`, so a script reload changes the rules the *next* decision is made under and never erases a
   run. That is the whole reason the layering is: script for behavior, this module for durability.

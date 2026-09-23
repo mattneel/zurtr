@@ -4,6 +4,13 @@ Normative. Types named here are contracts, not final declarations; the
 semantics are what implementations must satisfy. Zig type names use the
 `zurtr.<module>` namespace (e.g. `zurtr.data.Tx`).
 
+Status: nothing in §1's parked and deferred classes is implemented in this tree
+(`overview.md` §Execution model records why: the park sentinel these rules were
+written against was swerver's, and zix has no counterpart). §3's adapter
+position and §2's transport row are stated against the tree; the rest of the
+document is the design the implemented modules (`data`, `live`, `runtime`) and
+the declared ones are held to.
+
 ## 1. Execution
 
 Three classes, defined in `overview.md` §Execution model. Rules:
@@ -33,7 +40,7 @@ Three classes, defined in `overview.md` §Execution model. Rules:
 
 | Data | Owner | Lifetime | May be stored in session/job/agent state? |
 | --- | --- | --- | --- |
-| Request view slices | swerver connection | handler call | No |
+| Request view slices | zix connection | handler call | No |
 | Request arena | request | until response queued | No |
 | Event arena | live dispatch | until patches queued for the event | No |
 | Decoded event payload | event arena | event | Only after explicit copy into session storage |
@@ -59,8 +66,12 @@ Rules:
 ## 3. Persistence
 
 - `zurtr.data.Database`: `query`, `exec`, `begin`, `close`. Adapter
-  implementations share this interface; PostgreSQL is the first implementation
-  (transport: the vendored swerver PG client, parking on the reactor).
+  implementations share this interface. Turso is the only built adapter, opened
+  at one of four tiers (`docs/modules/data.md`); PostgreSQL is declared over
+  zix's `postgrez` driver and is not built. The parked execution mode §1
+  describes is therefore unbuilt for the data layer: it relied on an
+  event-loop-integrated client that parks on the reactor, and zix's `postgrez`
+  does not park that way.
 - `zurtr.data.Tx`: scoped, not thread-safe, not storable. Acquired
   lexically (or by a surface that establishes one for an action). Nested
   scopes use savepoints. A tx that is neither committed nor rolled back at

@@ -3,6 +3,14 @@
 Scope: durable queues, schedules, retries, concurrency, cancellation. Delivery
 is at-least-once; idempotency is the caller's contract (`contracts.md` §5).
 
+Status: **declared** — no implementation in this tree (`src/root.zig`'s module
+table). The model below is written against PostgreSQL: the DDL
+(`bigserial`, `timestamptz`, `bytea`), `FOR UPDATE SKIP LOCKED`, and
+`LISTEN`/`NOTIFY` for wakeups. The only adapter in the tree is Turso, which is
+SQLite-compatible (`src/data/turso_adapter.zig`) and has neither
+`SKIP LOCKED` nor `LISTEN`/`NOTIFY`, so the queue's storage and its wake-up
+path are unresolved (`docs/modules/data.md`).
+
 ## Durable model (PostgreSQL)
 
 ```sql
