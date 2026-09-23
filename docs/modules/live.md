@@ -27,6 +27,35 @@ One owner per session: all mutations happen on the session's worker thread.
 Asynchronous completions (job results, pub/sub, timers) are delivered into the
 owner's queue as `Info` messages, never by touching session state directly.
 
+## The bus (`live/pubsub.zig`)
+
+A session subscribes to topics; anything that has just committed a write publishes to a topic; every
+subscriber that is *present* is handed the message. Subscription is server-side and component-driven
+(`Subscribes on init to user/<user_id>/tasks`) — the client has no subscribe message, and cannot ask for
+a topic the component did not declare.
+
+What the broker is, precisely:
+
+- **Worker-local, single-threaded.** It belongs to the worker that owns the sessions, and every operation
+  happens on that thread. One owner per session is the rule it rests on, so a lock would be a lie.
+- **Delivery is per session.** A subscription carries the receiver for the session that owns it: the
+  session's queue gets an `Info` message, which is how `live.md` requires asynchronous completions to
+  arrive — never by touching session state from outside its owner.
+- **Ordered, with a gap-checkable sequence.** Messages carry a per-broker monotonic `seq` in publication
+  order, so a subscriber can tell it missed something and ask for a resync rather than render a stale
+  view.
+- **Exactly once per present subscriber.** Subscribing twice is one subscription (a reconnect that
+  re-initializes a session must not duplicate its view), and `unsubscribeAll` on terminate makes a gone
+  session unreachable.
+- **Not durable, not transactional.** A publish with no subscribers is dropped, and one during a
+  reconnect is gone. The durable path is the outbox: the event commits in the same transaction as the
+  state change, and a view that missed events resyncs from a revisioned snapshot. `app` publishes *after*
+  the commit for the same reason — a subscriber must never act on a write that was rolled back.
+
+This is also the seam distribution hangs off: the bus already carries "this happened" between a job, a
+session and an agent on one worker, and putting `data`'s tiers underneath it is what carries the same
+statement between machines.
+
 ## Render representation
 
 A single representation serves initial HTML and later patches (see

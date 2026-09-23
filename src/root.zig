@@ -22,6 +22,8 @@ pub const runtime = struct {
 /// Live UI: session state, events, render/patch, protocol.
 pub const live = struct {
     pub const protocol = @import("live/protocol.zig");
+    /// The worker's bus: sessions subscribe to topics, committed writes publish to them.
+    pub const pubsub = @import("live/pubsub.zig");
 };
 
 /// Script: the QuickJS seam. Behavior the host can replace without a native rebuild.
@@ -74,5 +76,6 @@ test "zurtr module builds and links the transport" {
 test {
     _ = runtime.pool;
     _ = live.protocol;
+    _ = live.pubsub;
     _ = data;
 }
