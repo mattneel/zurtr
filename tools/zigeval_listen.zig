@@ -27,7 +27,14 @@
 //!     file and renames it over eval.zig, which always yields a new inode, and every eval
 //!     logs a nonce first; a result carrying any other nonce is rejected as stale.
 //!  5. The incremental compiler recovers from parse errors and semantic errors without
-//!     a restart.
+//!     a restart. This one is tested rather than cited: there is no single line of
+//!     compiler source that promises it.
+//!  6. **The compiler sizes its worker pool from the CPU affinity mask** — `main.zig`
+//!     uses `std.Thread.getCpuCount` (sched_getaffinity plus CPU_COUNT) as the job limit
+//!     unless `-j` is given. That is why this tool passes `-j1`: one expression is one
+//!     unit of work, so extra workers cannot help, and spreading a tiny update across
+//!     them costs 4x (unpinned, ten same-size evals: 102 ms with the default pool, 26 ms
+//!     with `-j1`, and a pinned run looks the same because `taskset` shrinks the mask).
 //!
 //! Four things this depends on that are *not* contracts, documented here because a rebase
 //! could change any of them without breaking the self-test:
@@ -131,8 +138,10 @@ pub const Evaluator = struct {
 
         ev.child = try std.process.spawn(io, .{
             .argv = &.{
+                // `-j1` (behaviour 6): the worker pool would otherwise follow the affinity
+                // mask, and one expression cannot use more than one worker.
                 options.zig_exe, "build-obj",   "-fno-emit-bin", "-fincremental",
-                "--listen=-",    "--cache-dir", "cache",         "eval.zig",
+                "--listen=-",    "--cache-dir", "cache",         "eval.zig", "-j1",
             },
             .cwd = .{ .dir = ev.dir },
             .stdin = .pipe,
@@ -240,6 +249,11 @@ fn interpret(gpa: Allocator, bundle: ErrorBundle, nonce: u64) !Result {
     const log_text: []const u8 = if (bundle.extra.len == 0) "" else bundle.getCompileLogOutput();
 
     // Behaviour 4: the first log line must be this eval's nonce.
+    //
+    // A *parse* error is the hole in this check, and it is worth naming: the compiler stops
+    // before analysis, so neither @compileLog runs, the log text is empty, and the nonce
+    // vouches for nothing. Only the temp-file rename stands between a parse error and the
+    // previous update's result being served as this one's.
     var nonce_buf: [64]u8 = undefined;
     const nonce_line = try std.fmt.bufPrint(&nonce_buf, "@as(u64, {d})\n", .{nonce});
     if (log_text.len != 0 and !std.mem.startsWith(u8, log_text, nonce_line)) return error.StaleResult;
@@ -303,6 +317,45 @@ pub fn main(init: std.process.Init) !void {
     const spawn_ms = nsSince(io, t_spawn) / std.time.ns_per_ms;
 
     try out.print("zigeval_listen against zig {s} ({s})\n", .{ ev.version, zig_exe });
+
+    // `--bench N`: N evals of a rotating same-size expression, reported with a p99. Ten
+    // samples cannot show a tail, and the tail is what a keystroke feels.
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--bench")) {
+        const count = try std.fmt.parseInt(usize, args[2], 10);
+        const samples = try gpa.alloc(f64, count);
+        defer gpa.free(samples);
+
+        for (samples, 0..) |*sample, i| {
+            var expr_buf: [16]u8 = undefined;
+            var want_buf: [32]u8 = undefined;
+            const expr = try std.fmt.bufPrint(&expr_buf, "1 + {d}", .{i});
+            const want = try std.fmt.bufPrint(&want_buf, "@as(comptime_int, {d})", .{i + 1});
+
+            const t0 = Io.Timestamp.now(io, .awake);
+            const failed = try expectQuiet(ev, out, .{ .expr = expr, .want = want });
+            sample.* = nsSince(io, t0) / std.time.ns_per_ms;
+            if (failed != 0) {
+                try out.print("{d} check(s) FAILED\n", .{failed});
+
+                return;
+            }
+        }
+
+        std.mem.sort(f64, samples, {}, std.sort.asc(f64));
+        const at = struct {
+            fn f(list: []const f64, q: f64) f64 {
+                return list[@min(list.len - 1, @as(usize, @intFromFloat(q * @as(f64, @floatFromInt(list.len)))))];
+            }
+        }.f;
+        var total: f64 = 0;
+        for (samples) |sample| total += sample;
+        try out.print("bench {d} evals of 1 + i (same-size rewrites)\n", .{count});
+        try out.print("  mean {d:.2} ms   p50 {d:.2} ms   p99 {d:.2} ms   max {d:.2} ms\n", .{
+            total / @as(f64, @floatFromInt(count)), at(samples, 0.50), at(samples, 0.99), samples[samples.len - 1],
+        });
+
+        return;
+    }
 
     if (args.len > 1) {
         for (args[1..]) |expr| {
