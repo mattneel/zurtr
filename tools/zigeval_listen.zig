@@ -17,8 +17,10 @@
 //!     are no errors (`serveUpdateResults`, src/main.zig).
 //!  3. `@compileLog` output arrives as the bundle's compile-log text: one line per call,
 //!     values printed as `@as(T, v)`. With no other errors the bundle also carries a
-//!     "found compile log statement" error; with other errors the text still arrives
-//!     but that error is left out (`getAllErrorsAlloc`, src/Compilation.zig).
+//!     "found compile log statement" error; with semantic errors the text still arrives
+//!     but that error is left out. With *parse* errors the text does not arrive at all
+//!     (`getAllErrorsAlloc` returns "" while `skip_analysis_this_update` is set,
+//!     src/Compilation.zig).
 //!  4. Incremental change detection is metadata only: size, mtime in ns, inode
 //!     (`updateFile`, src/Zcu/PerThread.zig). A same-size rewrite inside one mtime tick
 //!     would be missed and the previous result served again. So every eval writes a temp
@@ -26,6 +28,26 @@
 //!     logs a nonce first; a result carrying any other nonce is rejected as stale.
 //!  5. The incremental compiler recovers from parse errors and semantic errors without
 //!     a restart.
+//!
+//! Four things this depends on that are *not* contracts, documented here because a rebase
+//! could change any of them without breaking the self-test:
+//!  6. **Anything that logs corrupts a value.** The log text is one line per `@compileLog`
+//!     call in the whole update, and this tool's value is read as "the text after the
+//!     nonce". So an expression (or a prelude helper) that logs turns into extra lines in
+//!     the middle of the value. `interpret` now refuses any shape other than exactly two
+//!     lines rather than returning the concatenation, which is what it used to do: the
+//!     failure was a plausible wrong answer, not an error.
+//!  7. **The nonce being first is incidental.** With more than one logging unit the text
+//!     is sorted by resolved source location, so the nonce arrives first today because
+//!     `eval.zig` sorts first — not because anything promises it. Change the sort key and
+//!     a correct eval becomes `error.StaleResult`, with the self-test still green.
+//!  8. **A compiler-bug panic ends the session.** `Compilation.zig` panics on some
+//!     incremental inconsistencies, and `eval` has no recreate path; its escape hatch,
+//!     `--debug-incremental`, needs a compiler built with debug extensions.
+//!  9. **A built binary falls back to `"zig"`.** `zig run` and `zig test` export `ZIG_EXE`;
+//!     anything else resolves through PATH with the child's cwd set to the work dir, where
+//!     a version-resolving launcher shim cannot work and the handshake fails. Pass
+//!     `Options.zig_exe` explicitly, which a build step can do with `b.graph.zig_exe`.
 
 const std = @import("std");
 const Io = std.Io;
@@ -47,7 +69,8 @@ pub const Options = struct {
 pub const Result = union(enum) {
     /// Exactly what the compiler printed for the expression, e.g. `@as(u32, 42)`.
     value: []u8,
-    /// Parse or semantic errors, rendered the way `zig build` renders them.
+    /// Parse or semantic errors, rendered the way `zig build` renders them, or the raw log
+    /// text when an eval's output could not be attributed to it (`error.UnattributableResult`).
     errors: []u8,
 
     pub fn deinit(r: Result, gpa: Allocator) void {
@@ -198,6 +221,11 @@ pub const Evaluator = struct {
                     "update ended with neither errors nor compile log output",
                     .{},
                 ),
+                error.UnattributableResult => std.log.err(
+                    "the update logged {d} lines where 2 were expected (the nonce and the value); " ++
+                        "the expression or a prelude helper used @compileLog:\n{s}",
+                    .{ std.mem.count(u8, bundle.getCompileLogOutput(), "\n"), bundle.getCompileLogOutput() },
+                ),
                 else => {},
             }
             return err;
@@ -221,6 +249,13 @@ fn interpret(gpa: Allocator, bundle: ErrorBundle, nonce: u64) !Result {
         const msg = bundle.nullTerminatedString(bundle.getErrorMessage(msg_index).msg);
         if (!std.mem.eql(u8, msg, compile_log_msg)) real_errors += 1;
     }
+
+    // Behaviour 6: the log text is one line per logging call in the update, so exactly
+    // two lines are ours — the nonce and the expression's value. Anything else means
+    // something in the update logged, and the "value" would be a concatenation of the
+    // two. Refusing is the whole point: silently returning the concatenation is how a
+    // side-channel becomes a wrong answer with no error.
+    if (log_text.len != 0 and std.mem.count(u8, log_text, "\n") != 2) return error.UnattributableResult;
 
     if (real_errors != 0) {
         var aw: Io.Writer.Allocating = .init(gpa);
@@ -272,7 +307,21 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 1) {
         for (args[1..]) |expr| {
             const t0 = Io.Timestamp.now(io, .awake);
-            const result = try ev.eval(expr);
+            // An expression whose output cannot be attributed is a *report*, not a crash: this
+            // mode is what an editor drives, and a stack trace is not an answer it can show.
+            const result = ev.eval(expr) catch |err| {
+                try out.print("{s}\n  => error: {s}   ({d:.1} ms)\n", .{
+                    expr,
+                    switch (err) {
+                        error.UnattributableResult => "the eval logged, so its value cannot be told apart from the log",
+                        error.StaleResult => "the compiler served an earlier eval's result",
+                        else => @errorName(err),
+                    },
+                    nsSince(io, t0) / std.time.ns_per_ms,
+                });
+
+                continue;
+            };
             defer result.deinit(gpa);
             const ms = nsSince(io, t0) / std.time.ns_per_ms;
             switch (result) {
@@ -416,6 +465,30 @@ test "pinned: the compiler prints \"hi\" ++ \" there\" as @as(*const [8:0]u8, \"
     const recovered = try ev.eval("\"hi\" ++ \" there\"");
     defer recovered.deinit(gpa);
     try std.testing.expectEqualStrings("@as(*const [8:0]u8, \"hi there\")", recovered.value);
+}
+
+test "an expression that logs is refused, not concatenated into a value" {
+    const gpa = std.testing.allocator;
+    var wip: ErrorBundle.Wip = undefined;
+    try wip.init(gpa);
+    defer wip.deinit();
+    try wip.addRootErrorMessage(.{ .msg = try wip.addString(compile_log_msg) });
+
+    // Three lines when two are ours: the nonce, a side-channel, and the value. This is the
+    // shape a live `@compileLog` inside the expression produces, and the old `interpret`
+    // returned the side-channel and the value joined as one string with no error.
+    var bundle = try wip.toOwnedBundle("@as(u64, 7)\n\"side-channel\"\n@as(comptime_int, 1)\n");
+    defer bundle.deinit(gpa);
+    try std.testing.expectError(error.UnattributableResult, interpret(gpa, bundle, 7));
+
+    // A prelude helper logging lands the same way, one line later.
+    var wip2: ErrorBundle.Wip = undefined;
+    try wip2.init(gpa);
+    defer wip2.deinit();
+    try wip2.addRootErrorMessage(.{ .msg = try wip2.addString(compile_log_msg) });
+    var bundle2 = try wip2.toOwnedBundle("@as(u64, 8)\n@as(comptime_int, 2)\nhelper says hi\n");
+    defer bundle2.deinit(gpa);
+    try std.testing.expectError(error.UnattributableResult, interpret(gpa, bundle2, 8));
 }
 
 test "a result carrying an older nonce is rejected, never returned" {
