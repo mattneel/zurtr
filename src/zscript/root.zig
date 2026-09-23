@@ -1,4 +1,4 @@
-//! `zurtr.script` — the QuickJS seam.
+//! `zurtr.zscript` — the QuickJS seam.
 //!
 //! Scripts define behavior; the host defines what behavior is allowed to *reach*. That is the whole
 //! boundary: a script can call the host functions the host registered and nothing else, so replacing a

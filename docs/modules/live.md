@@ -77,9 +77,9 @@ A view is the component contract below, and its parts may come from either langu
 
 The correspondence is deliberate: a `TasksPage` is one declaration, and where its handlers live is a
 deployment choice rather than an architecture. A Zig view is compiled and typed end to end. A scripted
-view is loaded as a revision (`zurtr.script`) and its handlers call the same host functions a Zig handler
+view is loaded as a revision (`zurtr.zscript`) and its handlers call the same host functions a Zig handler
 would — authorization, validation and transactions included — so a reload changes behaviour without
-changing authority. See `docs/modules/script.md` for what a script can reach, and `agents.md` for the
+changing authority. See `docs/modules/zscript.md` for what a script can reach, and `agents.md` for the
 same rule applied to durable workflows.
 
 What is *not* on the table is a second renderer: both languages produce the same `tree.Tree`, and the

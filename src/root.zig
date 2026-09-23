@@ -40,17 +40,17 @@ pub const domain = struct {
     pub const validation = @import("domain/validation.zig");
 };
 
-/// Script: the QuickJS seam. Behavior the host can replace without a native rebuild.
+/// ZScript: the QuickJS seam. Behavior the host can replace without a native rebuild.
 ///
-/// The engine is behind `-Dscript`; the seam's own types do not need it, so a build that never asks
+/// The engine is behind `-Dzscript`; the seam's own types do not need it, so a build that never asks
 /// for the engine never pays for one.
-pub const script = @import("script/root.zig");
+pub const zscript = @import("zscript/root.zig");
 
 /// ZEEX: JSX templates lowered to Zig at build time, by a script the vendored engine runs.
 ///
 /// The compiler needs the script engine, so it is reachable only in builds that have one; the generated
 /// code needs nothing but this framework.
-pub const zeex = if (@import("build_options").script) @import("zeex/compile.zig") else struct {};
+pub const zeex = if (@import("build_options").zscript) @import("zeex/compile.zig") else struct {};
 
 /// Data: queries, transactions, migrations, adapters.
 ///
@@ -109,5 +109,5 @@ test {
     _ = data;
     _ = domain;
     _ = jobs;
-    if (comptime @import("build_options").script) _ = zeex;
+    if (comptime @import("build_options").zscript) _ = zeex;
 }

@@ -97,14 +97,14 @@ pub fn build(b: *std.Build) void {
     // The script engine compiles QuickJS-ng's C through Zig and needs the LLVM backend, so the base
     // build must not ask for it. Same pattern as the adapter: the import name always resolves, and what
     // it resolves to depends on whether this build asked for the engine.
-    const enable_script = b.option(bool, "script", "Build the QuickJS script layer (vendored zig-quickjs-ng)") orelse false;
+    const enable_zscript = b.option(bool, "zscript", "Build ZScript, the QuickJS script layer (vendored zig-quickjs-ng)") orelse false;
 
-    const quickjs = if (enable_script) blk: {
+    const quickjs = if (enable_zscript) blk: {
         const dep = b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize });
 
         break :blk dep.module("quickjs");
     } else b.createModule(.{
-        .root_source_file = b.path("src/script/quickjs_not_built.zig"),
+        .root_source_file = b.path("src/zscript/quickjs_not_built.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -113,7 +113,7 @@ pub fn build(b: *std.Build) void {
     const zurtr_options = b.addOptions();
     zurtr_options.addOption(bool, "turso", enable_turso);
     zurtr_options.addOption(bool, "turso_sync", turso_sync);
-    zurtr_options.addOption(bool, "script", enable_script);
+    zurtr_options.addOption(bool, "zscript", enable_zscript);
 
     var zurtr_imports: std.ArrayList(std.Build.Module.Import) = .empty;
     zurtr_imports.append(b.allocator, .{ .name = "zix", .module = zix }) catch @panic("OOM");
@@ -149,7 +149,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    if (enable_script) {
+    if (enable_zscript) {
         exe.use_llvm = true;
         exe.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
     }
@@ -253,10 +253,10 @@ pub fn build(b: *std.Build) void {
     }
 
     var script_test_run: ?*std.Build.Step.Run = null;
-    if (enable_script) {
+    if (enable_zscript) {
         const script_tests = b.addTest(.{
             .root_module = b.createModule(.{
-                .root_source_file = b.path("src/script/root.zig"),
+                .root_source_file = b.path("src/zscript/root.zig"),
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{.{ .name = "quickjs", .module = quickjs }},
@@ -268,7 +268,7 @@ pub fn build(b: *std.Build) void {
         script_tests.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
 
         const run_script_tests = b.addRunArtifact(script_tests);
-        const test_script_step = b.step("test-script", "Run the script layer's tests against QuickJS");
+        const test_script_step = b.step("test-zscript", "Run the script layer's tests against QuickJS");
         test_script_step.dependOn(&run_script_tests.step);
         script_test_run = run_script_tests;
     }

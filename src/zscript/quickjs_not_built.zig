@@ -5,5 +5,5 @@
 //! for the engine, and the message says exactly that.
 
 comptime {
-    @compileError("the script layer is not built in this configuration: pass -Dscript=true (it compiles QuickJS-ng through Zig and links it with LLVM)");
+    @compileError("the script layer is not built in this configuration: pass -Dzscript=true (it compiles QuickJS-ng through Zig and links it with LLVM)");
 }

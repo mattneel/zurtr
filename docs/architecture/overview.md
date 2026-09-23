@@ -36,14 +36,14 @@ and the table is the side being corrected (`decisions.md` D7). *Declared* means
 this tree has the contract and no implementation; a module moves to
 *implemented* when its first real surface lands.
 
-Optional layers: `script` (QuickJS-ng, `docs/modules/script.md`) and `zeex`
+Optional layers: `script` (QuickJS-ng, `docs/modules/zscript.md`) and `zeex`
 (JSX lowered to Zig at build time by a script the build runs, `src/zeex/`) sit
 beside the modules rather than in the dependency order — nothing below them
 depends on them, and everything above them can. `script` is behavior a host can
 replace without a native rebuild, and the authority a script can reach is exactly
 the host functions the host registered; `zeex` is a build-time lowering that
 leaves nothing of itself in the running program. Both are behind build options
-(`-Dscript`, which `zeex` needs): the base build contains neither.
+(`-Dzscript`, which `zeex` needs): the base build contains neither.
 
 Dependency rule: arrows point downward only. `live` core never imports `domain`;
 the *glue* that binds live events to domain actions lives in `app` (a small
@@ -144,7 +144,7 @@ is therefore a deployment choice (role processes, or one process per shard).
   declares one `zurtr` module rooted at `src/root.zig`, with the vendored
   dependencies as the only separate modules (`decisions.md` D9).
 - Build options are the framework's own and all default off: `-Dturso` /
-  `-Dturso-sync` (the data adapter and its sync SDK Kit) and `-Dscript` (the
+  `-Dturso-sync` (the data adapter and its sync SDK Kit) and `-Dzscript` (the
   QuickJS layer and the `zeex` compiler that runs on it). zix has no build-time
   feature flags — its protocols, drivers and dispatch models are in-tree source,
   selected in configuration at run time — so the base build is the transport

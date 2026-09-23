@@ -1,11 +1,11 @@
-# Module contract: Script (`zurtr.script`)
+# Module contract: ZScript (`zurtr.zscript`)
 
-Scope: the optional scripting layer. QuickJS-ng through the vendored binding at
+Scope: ZScript, the optional scripting layer. QuickJS-ng through the vendored binding at
 `deps/quickjs-ng`, giving the application behavior the host can replace without a
 native rebuild. It is a *layer* rather than one of the seven modules: nothing
 below it depends on it, and everything above it can.
 
-Status: implemented behind `-Dscript` (`src/script/root.zig`); the base build
+Status: implemented behind `-Dzscript` (`src/zscript/root.zig`); the base build
 contains no engine, and the `zeex` template compiler (`src/zeex/compile.zig`) is
 the one caller in the tree — it runs the JSX transform as a build-time script.
 
@@ -45,11 +45,27 @@ the one that knows what a job recorded.
 
 Two rules that are easy to get wrong, both of which cost time here:
 
-- **Input is a C string.** `Context.eval` parses its input as NUL-terminated, so
-  a slice with an undefined tail is read past the end. `load` takes
-  `[:0]const u8` for that reason, and `callInt` terminates its own buffer. Zig
-  string literals already satisfy it; anything read from a file or built at
-  runtime must be terminated by its producer.
+- **Input is a C string, and the length parameter is what makes that easy to get
+  wrong.** `Context.eval` parses its input as NUL-terminated, so a slice with an
+  undefined tail is read past the end. `load` takes `[:0]const u8` for that
+  reason, and `callInt` terminates its own buffer. Zig string literals already
+  satisfy it; anything read from a file or built at runtime must be terminated by
+  its producer.
+
+  The engine is the origin of the rule, not an innocent above it: `JS_Eval()`
+  scans while `*p == '\0' && p >= s->buf_end`, so the sentinel is the contract
+  and the length is not. The trap is that these APIs *take* a length, which reads
+  as "so I do not need a terminator" — three layers of this stack have been
+  caught by it, and every time the failure was a plausible wrong answer rather
+  than an error. The engine's own instance reported `ReferenceError: Datea is not
+  defined`, having absorbed the byte after the buffer and made an identifier of
+  it.
+- **The wasm stack region and the engine's default limit are both 1 MiB.**
+  QuickJS defaults to a 1 MiB stack, which in a `wasm32-freestanding` module is
+  the entire stack the host gave it: `stack_top - stack_size` wraps, the guard
+  fails every evaluation, and nothing says why until `updateStackTop` is told the
+  real depth.
+
 - **A host function's result owns a reference.** The arguments are borrowed for
   the call, and returning one of them unmodified under-retains it: the engine
   then frees something it still counts as live. Return a fresh value
@@ -87,9 +103,9 @@ host: the engine's own message for the last throw is kept, not discarded.
 ## Build
 
 The engine compiles QuickJS-ng's C through Zig and needs the LLVM backend, so it
-is behind `-Dscript`: the base build does not ask for it, and the `quickjs`
+is behind `-Dzscript`: the base build does not ask for it, and the `quickjs`
 import resolves to a file whose whole content is a compile error naming the flag.
-`zig build test-script -Dscript=true` runs the layer's tests.
+`zig build test-zscript -Dzscript=true` runs the layer's tests.
 
 ## Testing requirements
 

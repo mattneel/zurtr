@@ -117,7 +117,7 @@ and none of them changes the loop:
   agent's tools *are* `domain` actions, so authorization, validation and transaction rules are the same
   ones an HTTP request goes through. Provider choice, credentials and prompt assembly belong to the
   application; this module records what was decided, not how.
-- **Decisions from a script.** `zurtr.script` may define `decide`/`apply` instead of Zig. What makes that
+- **Decisions from a script.** `zurtr.zscript` may define `decide`/`apply` instead of Zig. What makes that
   workable is the same thing that makes the sibling `jzs` package's agent addons workable: the durable
   surface is exposed as host functions — `emit`, `checkpoint`, `sleep`, `cancelRequested` — and the run's
   state is readable and writable through `state.get/set/del/list`. A script cannot reach the database, the
