@@ -137,6 +137,21 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
     }
 
     if (std.mem.eql(u8, name, "if")) {
+        // The transform emits `otherwise` empty; a non-empty one is an `else` this emitter does not
+        // support, and ignoring it would silently drop a branch. Refuse it as itself, loudly, rather
+        // than let a future producer's branch disappear.
+        if (object.get("otherwise")) |otherwise| {
+            const empty = switch (otherwise) {
+                .array => |items| items.items.len == 0,
+                else => false,
+            };
+            if (!empty) {
+                std.debug.print("zeex: the IR's `if` carries an `otherwise` branch, which this emitter does not support\n", .{});
+
+                return error.MalformedIr;
+            }
+        }
+
         try indent(w, depth);
         try w.writeAll("if (");
         try pathText(w, object.get("path").?);
@@ -166,6 +181,19 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
         // A capitalised tag is a component call: the props struct carries the component, and the
         // attributes become its argument struct — the JSX convention, lowered rather than interpreted.
         if (tag.len > 0 and std.ascii.isUpper(tag[0])) {
+            // A component takes no children (the convention for passing them is not decided), and the
+            // transform refuses them, so an IR that still carries some is not one this emitter knows:
+            // say so rather than dropping them.
+            const component_children = if (object.get("children")) |children| switch (children) {
+                .array => |items| items.items.len != 0,
+                else => true,
+            } else false;
+            if (component_children) {
+                std.debug.print("zeex: <{s}> is a component and the IR carries children; this emitter has nowhere to put them\n", .{tag});
+
+                return error.MalformedIr;
+            }
+
             try indent(w, depth);
             try w.print("try props.{s}(.{{", .{tag});
             if (object.get("attrs")) |attrs| {
@@ -196,6 +224,10 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
                         std.zig.fmtString(attr_name),
                         std.zig.fmtString(value.object.get("value").?.string),
                     });
+                } else if (std.mem.eql(u8, kind, "toggle")) {
+                    // A bare attribute is present: an empty value is true for an HTML boolean
+                    // attribute, and `AttrSpec.value == null` would omit the attribute instead.
+                    try w.print(".{{ .name = \"{f}\", .value = \"\" }}", .{std.zig.fmtString(attr_name)});
                 } else if (std.mem.eql(u8, kind, "path")) {
                     try w.print(".{{ .name = \"{f}\", .value = ", .{std.zig.fmtString(attr_name)});
                     try pathText(w, value.object.get("path").?);
@@ -218,7 +250,8 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
     return error.MalformedIr;
 }
 
-/// Write the Zig expression for an attribute value: a path, a toggle, or the component form's value.
+/// Write the Zig expression for an attribute value: a path, a bare attribute (present, written as an
+/// empty string), or a static string in the component form.
 fn emitAttrValue(w: anytype, value: std.json.Value) EmitError!void {
     const kind = value.object.get("kind").?.string;
 
@@ -228,6 +261,10 @@ fn emitAttrValue(w: anytype, value: std.json.Value) EmitError!void {
 
     if (std.mem.eql(u8, kind, "static")) {
         return w.print("\"{f}\"", .{std.zig.fmtString(value.object.get("value").?.string)});
+    }
+
+    if (std.mem.eql(u8, kind, "toggle")) {
+        return w.writeAll("\"\"");
     }
 
     return error.MalformedIr;
@@ -279,4 +316,41 @@ test "a template lowers to Zig that parses, and the IR says what it should" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "a bare attribute lowers to a present attribute with an empty value" {
+    const allocator = std.testing.allocator;
+
+    // A bare attribute is present, which for an HTML boolean attribute means an empty value. The
+    // emitter used to have no case for the transform's `toggle` kind at all, so this template failed
+    // with MalformedIr and no line; the pair is what this test holds together.
+    const generated = try compile_template(allocator, "<input disabled>");
+    defer allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".name = \"disabled\", .value = \"\"") != null);
+
+    var ast = try std.zig.Ast.parse(allocator, generated, .{ .mode = .zig });
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "what the subset refuses comes back as TemplateRejected, with the line" {
+    const allocator = std.testing.allocator;
+
+    // Children on a component: there is no decided convention for passing them, and dropping them
+    // silently is worse than refusing.
+    try std.testing.expectError(error.TemplateRejected, compile_template(allocator,
+        \\<div>
+        \\  <Card>
+        \\    <p>child</p>
+        \\  </Card>
+        \\</div>
+    ));
+
+    // An expression after `props.`: a path segment is a field name, and the emitter writes it into the
+    // generated source verbatim, so `props.a + 1` would become code rather than a compile error here.
+    try std.testing.expectError(error.TemplateRejected, compile_template(allocator, "<div>{props.a + 1}</div>"));
+
+    // A loop variable named `b` would shadow the Builder inside the generated function.
+    try std.testing.expectError(error.TemplateRejected, compile_template(allocator, "<ul>{props.items.map(b => <li>{b}</li>)}</ul>"));
 }

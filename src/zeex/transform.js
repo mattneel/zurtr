@@ -11,16 +11,20 @@
 // silent misparse:
 //
 //   <div class="card" id={props.id}>…</div>      element, static and interpolated attributes
+//   <input disabled>                             a bare attribute (present, rendered empty)
 //   <br/>                                        self-closing and void elements
-//   {props.title}                                member path — the only expression form
+//   {props.title}                                member path — the only expression form; every segment
+//                                                is a field name, and anything else is refused
 //   {__raw(props.html)}                          verbatim interpolation, explicit and greppable
-//   {props.show && <p>…</p>}                     conditional
+//   {props.show && <p>…</p>}                     conditional (there is no else)
 //   {props.items.map(function (item) { … })}     iteration, and the ES5 arrow form
 //   {props.items.map(item => <li>{item}</li>)}
 //
 // Interpolation is a *path*, never an expression, so the generated Zig reads a field of the props struct
 // and a typo becomes a Zig compile error rather than a blank spot on a page. Text is escaped; `__raw` is
-// the one way to say otherwise.
+// the one way to say otherwise. A capitalised tag is a component call and takes no children (that
+// convention is not decided yet, so children are refused rather than dropped); a loop variable may not
+// be `b`, `props` or `zurtr`, nor a name an enclosing loop already bound.
 
 function fail(message, line) {
   throw new Error("zeex: " + message + (line ? " (line " + line + ")" : ""));
@@ -30,6 +34,28 @@ var VOID_TAGS = {
   area: 1, base: 1, br: 1, col: 1, embed: 1, hr: 1, img: 1, input: 1,
   link: 1, meta: 1, param: 1, source: 1, track: 1, wbr: 1,
 };
+
+// A path segment is a field name, never an expression: the emitter writes `props.<segment>` straight
+// into the generated Zig, so anything else would become code in the output.
+var SEGMENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// Names the generated code binds itself. A loop variable using one of these would shadow the Builder
+// (`b`) or the props struct (`props`) or the framework import (`zurtr`) inside the generated function.
+var RESERVED_VARS = { b: 1, props: 1, zurtr: 1 };
+
+// A capitalised tag is a component call — the same spelling convention the emitter uses (`std.ascii.isUpper`).
+function isComponentTag(tag) {
+  return tag.length > 0 && tag[0] >= "A" && tag[0] <= "Z";
+}
+
+// Children that are more than markup whitespace: text with something in it, or any node.
+function hasContent(children) {
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+    if (child.op !== "text" || child.value.trim().length > 0) return true;
+  }
+  return false;
+}
 
 function lineAt(source, index) {
   var line = 1;
@@ -49,7 +75,13 @@ function parsePath(text, loopVars, index, source) {
 
   if (head === "props") {
     if (parts.length < 2) fail("expected a property of `props`, not `props` itself", lineAt(source, index));
-    for (var i = 1; i < parts.length; i++) path.push(parts[i].trim());
+    for (var i = 1; i < parts.length; i++) {
+      var segment = parts[i].trim();
+      if (!SEGMENT.test(segment)) {
+        fail("`" + segment + "` is not a property name: a path segment is a field of `props`, never an expression", lineAt(source, index));
+      }
+      path.push(segment);
+    }
   } else if (loopVars[head] === 1) {
     if (parts.length !== 1) fail("a loop variable has no properties here: " + raw, lineAt(source, index));
     path.push("$" + head);
@@ -189,6 +221,7 @@ Parser.prototype.parseChildren = function (closingTag) {
 };
 
 Parser.prototype.parseElement = function () {
+  var start = this.at;
   this.take("<");
   var tag = this.readName();
   var attrs = [];
@@ -223,16 +256,28 @@ Parser.prototype.parseElement = function () {
       continue;
     }
 
-    // A bare attribute is a boolean: rendered when the path is true.
+    // A bare attribute is present: the emitter renders it as an empty value, which is what an HTML
+    // boolean attribute (`<input disabled>`) means. It must never reach the emitter as an unknown kind.
     attrs.push({ name: name, value: { kind: "toggle" } });
   }
+
+  var component = isComponentTag(tag);
 
   if (selfClosing || VOID_TAGS[tag] === 1) {
     return { op: "element", tag: tag, attrs: attrs, children: [] };
   }
 
   var children = this.parseChildren(tag);
-  return { op: "element", tag: tag, attrs: attrs, children: children };
+
+  // A capitalised tag is a component call, and the emitter has nowhere to put children: passing them
+  // is a convention that has not been decided, so real content is refused here — where the line
+  // number is — rather than dropped in the generated code. Whitespace-only children are markup
+  // formatting, not content, and are normalized away below.
+  if (component && hasContent(children)) {
+    fail("<" + tag + "> is a component and cannot have children: the emitter has nowhere to put them", lineAt(this.source, start));
+  }
+
+  return { op: "element", tag: tag, attrs: attrs, children: component ? [] : children };
 };
 
 Parser.prototype.parseBraced = function () {
@@ -279,6 +324,15 @@ Parser.prototype.parseBraced = function () {
       item = fn[2];
     } else {
       this.fail("only `path.map(item => …)` and `path.map(function (item) { … })` iterate");
+    }
+
+    // The name is interpolated into `for (…) |name|` verbatim, so a reserved or already-bound one
+    // would shadow something the generated function needs.
+    if (RESERVED_VARS[item] === 1) {
+      fail("`" + item + "` is a name the generated code binds; pick another loop variable", lineAt(this.source, start));
+    }
+    if (this.loopVars[item] === 1) {
+      fail("`" + item + "` is already bound by an enclosing loop", lineAt(this.source, start));
     }
 
     var innerStart = start + 1 + body.indexOf("<");
