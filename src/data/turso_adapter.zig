@@ -100,6 +100,11 @@ pub const Engine = struct {
     /// at a time (nesting is a surface concern, expressed with savepoints); a second concurrent `begin`
     /// is a programming error, reported as `error.Operation`.
     tx: ?turso.Transaction = null,
+    /// The `Tx` handle handed to the caller for that transaction. The adapter owns it: the contract says
+    /// a `Tx` is not storable, which means the last moment it *can* be in use is the next `begin` or the
+    /// engine closing — so those are where it is released. A transaction is the one object this layer
+    /// creates on every write path, which is why letting the caller's allocator decide was not enough.
+    tx_handle: ?*data.Tx = null,
     /// Parameter scratch, reused per call.
     values: std.ArrayList(turso.Value) = .empty,
     /// Row scratch, reused per row.
@@ -244,6 +249,9 @@ pub const Engine = struct {
         const self: *Engine = @ptrCast(@alignCast(context));
         if (self.tx != null) return error.Operation;
 
+        // Whatever the caller did with the previous handle, it is spent: it was lent for one scope.
+        self.releaseTxHandle();
+
         // The distributed tier's rule, enforced where writes actually begin rather than trusted to the
         // caller: a node writes only while it holds the lease, and a follower that asks to write while
         // someone else holds it is told so. Reads never need the lease — one writer, many readers.
@@ -253,15 +261,24 @@ pub const Engine = struct {
         }
 
         self.tx = self.connection.begin(.immediate, .{}) catch |err| return mapError(err);
+        errdefer {
+            // A transaction with no handle to commit it is the engine's state leaking too, not just this
+            // allocation.
+            if (self.tx) |*live| live.rollback(null) catch {};
+            self.tx = null;
+        }
 
+        const live = &(self.tx orelse return error.Internal);
         const tx = self.allocator.create(data.Tx) catch return error.Internal;
+        errdefer self.allocator.destroy(tx);
         tx.* = .{
             // `exec` and `query` receive the `*Tx` and route through it; the context is the live
             // transaction handle, which is what they actually need.
-            .context = if (self.tx) |*handle| @ptrCast(handle) else return error.Internal,
+            .context = @ptrCast(live),
             .database = &self.handle,
             .mode = mode,
         };
+        self.tx_handle = tx;
 
         return tx;
     }
@@ -304,6 +321,8 @@ pub const Engine = struct {
         self.values.deinit(self.allocator);
         self.columns.deinit(self.allocator);
 
+        self.releaseTxHandle();
+
         if (self.connection_opened) {
             self.connection.deinit();
             self.connection_opened = false;
@@ -318,6 +337,15 @@ pub const Engine = struct {
                 synced.deinit();
                 self.synced = null;
             }
+        }
+    }
+
+    /// Release the `Tx` the caller was handed, if it is still outstanding. Safe to call at any point
+    /// the caller cannot still be using it: the start of the next transaction, and close.
+    fn releaseTxHandle(self: *Engine) void {
+        if (self.tx_handle) |tx| {
+            self.allocator.destroy(tx);
+            self.tx_handle = null;
         }
     }
 

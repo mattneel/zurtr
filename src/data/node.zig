@@ -64,8 +64,10 @@ const Options = struct {
     node: []const u8 = "",
     role: data.Tier.Role = .follower,
     write: ?[]const u8 = null,
-    hold_ms: i64 = 0,
-    retry_ms: i64 = 0,
+    /// Durations, not counts of milliseconds: the flags name the unit once, where they are read, so
+    /// nothing downstream has to remember which unit a bare integer was in.
+    hold: Io.Duration = .zero,
+    retry: Io.Duration = .zero,
     /// Never dialled at this tier: `.distributed` is local-first, and its remote half is the same
     /// transport `.sync` is waiting on.
     remote: []const u8 = "https://example.invalid",
@@ -95,9 +97,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, flag, "--write")) {
             options.write = value;
         } else if (std.mem.eql(u8, flag, "--hold-ms")) {
-            options.hold_ms = std.fmt.parseInt(i64, value, 10) catch return complain(init.io, usage);
+            options.hold = millisecondsFlag(value) orelse return complain(init.io, usage);
         } else if (std.mem.eql(u8, flag, "--retry-ms")) {
-            options.retry_ms = std.fmt.parseInt(i64, value, 10) catch return complain(init.io, usage);
+            options.retry = millisecondsFlag(value) orelse return complain(init.io, usage);
         } else if (std.mem.eql(u8, flag, "--remote")) {
             options.remote = value;
         } else {
@@ -122,12 +124,12 @@ pub fn main(init: std.process.Init) !void {
 
     // The holder's half: renew the lease and stay up, so the orchestrator can observe a second node
     // being refused for as long as it needs, however slow the machine is.
-    if (options.hold_ms > 0) try hold(init.io, &db, options.node, options.hold_ms);
+    if (options.hold.nanoseconds > 0) try hold(init.io, &db, options.node, options.hold);
 
-    if (options.retry_ms > 0 and std.mem.eql(u8, frame.first_write, "conflict")) {
+    if (options.retry.nanoseconds > 0 and std.mem.eql(u8, frame.first_write, "conflict")) {
         // The follower's half: wait out the holder's lease and try again, which is the whole recovery
         // story for a node that stopped renewing.
-        try waitForExpiry(init.io, &db, options.node, options.retry_ms);
+        try waitForExpiry(init.io, &db, options.node, options.retry);
 
         try frame.retry(init.io, &db, try attempt(&db, options.write));
     }
@@ -290,14 +292,15 @@ const Frame = struct {
     }
 };
 
-/// Keep the lease for `hold_ms`, renewing it as a live holder does, then stop renewing — the process
+/// Keep the lease for `hold`, renewing it as a live holder does, then stop renewing — the process
 /// exits next, and what it held expires on the lease's own clock.
-fn hold(io: Io, db: *data.Database, node: []const u8, hold_ms: i64) !void {
+fn hold(io: Io, db: *data.Database, node: []const u8, duration: Io.Duration) !void {
     const engine = adapter.engine(db);
-    // The deadline is in the clock's unit (microseconds), not the flag's: comparing a microsecond
-    // elapsed against a millisecond argument is a two-millisecond hold that looks like a working one
-    // from the outside until something has to be alive to be observed.
-    const until_micros = nowMicros(io) + Io.Duration.fromMilliseconds(hold_ms).toMicroseconds();
+    // One conversion, through the type's own accessor. Comparing a microsecond elapsed against a
+    // millisecond number is a two-millisecond hold that looks like a working one from the outside
+    // until something has to be alive to be observed, and a flag is exactly where that number would
+    // have come from.
+    const until_micros = nowMicros(io) + duration.toMicroseconds();
 
     while (true) {
         if (!try engine.claimLease(adapter.default_lease, node, nowMicros(io))) return error.LeaseLost;
@@ -317,14 +320,21 @@ const renew_ms = 150;
 /// The wait watches the *row* — a follower can read the expiry, so it waits for that expiry instead of
 /// sleeping for a duration it guessed. `budget_ms` (the `--retry-ms` flag) is the bound, so a lease
 /// that never frees ends the wait and lets the attempt below fail loudly rather than hanging.
-fn waitForExpiry(io: Io, db: *data.Database, node: []const u8, budget_ms: i64) !void {
-    const deadline = nowMicros(io) + Io.Duration.fromMilliseconds(budget_ms).toMicroseconds();
+fn waitForExpiry(io: Io, db: *data.Database, node: []const u8, budget: Io.Duration) !void {
+    const deadline = nowMicros(io) + budget.toMicroseconds();
 
     while (nowMicros(io) < deadline) {
         if (try leaseFree(adapter.engine(db), node, nowMicros(io))) return;
 
         try Io.sleep(io, Io.Duration.fromMilliseconds(renew_ms), .awake);
     }
+}
+
+/// The `--hold-ms` and `--retry-ms` flags in the one place their unit is allowed to exist.
+fn millisecondsFlag(text: []const u8) ?Io.Duration {
+    const value = std.fmt.parseInt(i64, text, 10) catch return null;
+
+    return Io.Duration.fromMilliseconds(value);
 }
 
 /// Whether this node could take the lease now: no row at all, a row of its own, or a row whose expiry

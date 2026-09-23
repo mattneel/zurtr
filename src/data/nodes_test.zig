@@ -50,8 +50,9 @@
 //!   * A *renews* the lease for `hold_ms` and then stops and exits. Renewal is what makes the first
 //!     assertion independent of machine speed: B is refused because A is a live holder, not because B
 //!     happened to arrive inside a lease window. B is started after A's first line is *read*, not after
-//!     a guess, and the test checks A's pid is still alive at the moment B was refused (`/proc`, Linux
-//!     only — supporting evidence; the proof is that B saw A as the lease holder).
+//!     a guess, and "alive" is asked of the process table (`kill(pid, 0)`) rather than of the lease row
+//!     — a row outlives its process, which is exactly how a two-millisecond "holder" once passed every
+//!     check in this file.
 //!   * B waits after the refusal for the lease row's expiry to pass, reading the row rather than
 //!     sleeping for a guess (`--retry-ms` is the budget, not the wait), and then attempts the write
 //!     once more. The test waits for A to exit in between, so the order "A gone, then B takes over" is
@@ -62,7 +63,6 @@
 //! while a live holder is renewing would be a real bug in the lease, not a flake to paper over.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const data = @import("root.zig");
 const adapter = @import("turso_adapter.zig");
@@ -172,6 +172,8 @@ test "two live processes over one database file: reads anywhere, one writer at a
     try std.testing.expectEqualStrings("committed", a_first.write);
     try std.testing.expectEqualStrings("node-a", a_first.lease_holder.?);
     try std.testing.expect(a_first.lease_mine);
+    // The line says the lease is A's; this says A is there to hold it.
+    try std.testing.expect(running(a_first.pid));
 
     // --- node B: starts while A holds ----------------------------------------------------------
     var b = try std.process.spawn(io, .{
@@ -204,18 +206,16 @@ test "two live processes over one database file: reads anywhere, one writer at a
     try std.testing.expectEqualStrings("node-a", b_first.lease_holder.?);
     try std.testing.expect(!b_first.lease_mine);
 
-    if (builtin.os.tag == .linux) {
-        // A had not exited when it refused B. The hold above is what makes this true, and asserting it
-        // is what keeps the refusal from being read as "A had already died".
-        try std.testing.expect(try running(io, a_first.pid));
-    }
+    // A was *alive* when it refused B: the refusal is inside its hold, not the echo of a claim its
+    // process has already stopped renewing. Asserted against the process table, at this moment.
+    try std.testing.expect(running(a_first.pid));
 
     // --- A exits, then B takes over -------------------------------------------------------------
     // Waiting for A here is what makes the next line's meaning unambiguous: B's second attempt
     // happened after its holder was gone *and* after the lease's expiry.
     const a_term = try a.wait(io);
     try std.testing.expect(a_term.success());
-    if (builtin.os.tag == .linux) try std.testing.expect(!try running(io, a_first.pid));
+    try std.testing.expect(!running(a_first.pid));
 
     const b_second = try takeReport(&b_out.interface, arena);
 
@@ -294,6 +294,10 @@ test "a killed holder's lease expires, and the survivor takes over" {
     // it inside its hold with a lease it has already pushed forward once more.
     try Io.sleep(io, Io.Duration.fromMilliseconds(settled_ms), .awake);
 
+    // "Killed mid-hold" is the premise of everything below, so it is asserted rather than assumed: the
+    // holder is in the process table right now, and the lease it is renewing is not a leftover.
+    try std.testing.expect(running(holder_first.pid));
+
     // SIGKILL: uncatchable, so there is no handler to flush anything and no release to run. The lease
     // row it wrote is now all that is left of it.
     try std.posix.kill(holder_first.pid, .KILL);
@@ -308,6 +312,9 @@ test "a killed holder's lease expires, and the survivor takes over" {
         std.debug.print("the holder did not die by SIGKILL: {f}\n", .{holder_term});
         return error.TestUnexpectedResult;
     }
+
+    // And it is gone: not exited, *killed* — the lease row below is all that is left of it.
+    try std.testing.expect(!running(holder_first.pid));
 
     // --- the survivor: opens the file the killed process still holds a lease on -----------------
     var survivor = try std.process.spawn(io, .{
@@ -395,12 +402,18 @@ fn parse(arena: std.mem.Allocator, line: []const u8) !Report {
     return parsed.value;
 }
 
-/// Whether a process still exists. Linux only, and only ever supporting evidence.
-fn running(io: Io, pid: i32) !bool {
-    var buffer: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buffer, "/proc/{d}", .{pid});
-
-    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+/// Whether a process still exists, asked of the process table rather than of anything it left behind.
+///
+/// `kill(pid, 0)` delivers nothing and answers "is it there" — which is the only way to assert *while
+/// the holder is alive* without asking evidence that outlives the thing it vouches for. The lease row
+/// does outlive its process by a second; that is exactly how a holder that had exited two milliseconds
+/// after claiming still satisfied every check in this file.
+fn running(pid: i32) bool {
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return switch (err) {
+        error.ProcessNotFound => false,
+        // Not ours to signal: it is there, and being there is all this asks.
+        else => true,
+    };
 
     return true;
 }

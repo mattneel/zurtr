@@ -181,6 +181,33 @@ test "a transaction reads its own uncommitted writes" {
     try std.testing.expectEqual(@as(usize, 0), after.rows.items.len);
 }
 
+test "a transaction's handle is released by the adapter, not by the allocator it came from" {
+    // Deliberately *not* an arena: a `Tx` the adapter forgets to release is invisible to a test that
+    // frees everything at once at the end, and a transaction is the one allocation this layer makes on
+    // every write path. `std.testing.allocator` is the only witness that notices.
+    var db = try adapter.open(std.testing.allocator, std.testing.io, .memory);
+    defer db.close();
+
+    try schema(&db);
+
+    var committed = try db.begin(.read_write);
+    _ = try db.exec(committed, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = 1 }, .{ .text = "kept" }, .{ .integer = 1 },
+    });
+    try committed.commit();
+
+    var rolled = try db.begin(.read_write);
+    _ = try db.exec(rolled, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = 2 }, .{ .text = "discarded" }, .{ .integer = 1 },
+    });
+    rolled.rollback();
+
+    // A third transaction, so the first two handles have to be gone by now rather than all of them at
+    // the end; `close` releases this one.
+    var last = try db.begin(.read_write);
+    try last.commit();
+}
+
 test "the file tier survives closing and reopening" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
