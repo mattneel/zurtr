@@ -4,13 +4,11 @@ Scope: resources, typed actions, validation, authorization, relationships.
 The domain is where an application's operations are declared once and reused by
 every surface (HTTP endpoint, live event, job, agent tool).
 
-Status: **declared** in `src/root.zig`'s module table, and nothing imports the
-code that is in the tree: `src/domain/{action,policy,validation}.zig` exists but
-is not exported from `src/root.zig`, so it is not part of the module surface
-this document describes. Two further gaps between this contract and that code:
-the spec shape below shows `validate(input)`, while the code requires
-`Spec.validate(std.mem.Allocator, Input)` (`src/domain/action.zig`), and the
-resource/relationship layer (§Resources) has no file at all.
+Status: the module's code is in the tree (`src/domain/{action,policy,validation}.zig`)
+and is being wired into the module surface so the inventory matches it
+(`decisions.md` D7). The resource/relationship layer (§Resources) is still
+contract only — there is no file for it yet — and `validate` takes the
+allocator as its first parameter, which the spec shape below states.
 
 ## Actions
 
@@ -23,7 +21,7 @@ pub fn Action(comptime Spec: type) type;
 //   pub const Input = struct { ... };      // plain data
 //   pub const Output = struct { ... };     // plain data or void
 //   pub const policy = Policy.all_of(.{ invoice_write });  // default: deny
-//   pub fn validate(input: Input) Validation(Input);       // structural checks
+//   pub fn validate(allocator: Allocator, input: Input) Validation(Input); // structural checks
 //   pub fn run(ctx: *Ctx, input: Input) Error!Output;      // the operation
 ```
 

@@ -2,12 +2,17 @@
  * zurtr live browser bridge - no-build-step DOM client for the zurtr Live UI. Spec:
  * docs/modules/live.md §Render representation (data-z ids), §Patch ops, §Protocol (frames);
  * contracts.md §6 (focus/selection/form survival, resync); dev.md (paint beacon). One global: window.ZurtrLive.
+ *
+ * The live channel is WebTransport over HTTP/3 (docs/architecture/decisions.md D3); an explicit
+ * `ws://` / `wss://` endpoint selects the WebSocket fallback, and this client never downgrades on
+ * its own. The WebTransport path is written to the transport's own convention but is unexercised:
+ * no zurtr endpoint serves it yet, and zurtr_live_test.html stubs WebSocket only.
  */
 (function () {
   "use strict";
   const FLUSH_MS = 10, BATCH_MAX = 64, CHANGE_MS = 100, PENDING_MAX = 256; // protocol tunables
   const BACKOFF_MIN = 100, BACKOFF_MAX = 5000;
-  const cfg = { token: null, rev: 0, ws: null };
+  const cfg = { token: null, rev: 0, endpoint: null };
   const pending = new Map(); // event id -> {id, ev, payload, el}: sent, not yet acked
   const timers = new Map();  // element -> data-z-change debounce timer
   let sock = null, tries = 0, retryT = 0, flushT = 0, closed = false;
@@ -215,6 +220,66 @@
     try { xhr.send(body); } catch (e) { report(0, total, false, e && e.message); }
   }
 
+  // --- the live channel ----------------------------------------------------
+  // WebTransport is the channel (Live UI over HTTP/3, one origin with the page); a `ws://` /
+  // `wss://` endpoint selects the WebSocket fallback. Frames are the same text JSON either way;
+  // over WebTransport they are newline-delimited on one bidirectional stream, the convention
+  // zix's own examples use (deps/zix/examples/tls/webtransport_live.html). This client never
+  // downgrades by itself: a deployment that needs the fallback configures a ws:// endpoint
+  // (decisions.md D3).
+  const LIVE_PATH = "/zurtr/live";
+  const encoder = new TextEncoder(), decoder = new TextDecoder();
+
+  function webSocketLink(url) {
+    const s = new WebSocket(url);
+    const link = { kind: "websocket", url, readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null };
+    link.send = (text) => s.send(text);
+    link.close = () => s.close();
+    s.onopen = () => { link.readyState = 1; if (link.onopen) link.onopen(); };
+    s.onmessage = (m) => { if (link.onmessage) link.onmessage(m && m.data); };
+    s.onclose = () => { link.readyState = 3; if (link.onclose) link.onclose(); };
+    s.onerror = () => { if (link.onerror) link.onerror(); };
+    return link;
+  }
+
+  function webTransportLink(url) {
+    const link = { kind: "webtransport", url, readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null, send: null, close: null };
+    (async () => {
+      try {
+        const session = new WebTransport(url);
+        link.session = session;
+        await session.ready;
+        const stream = await session.createBidirectionalStream();
+        const writer = stream.writable.getWriter();
+        const reader = stream.readable.getReader();
+        link.readyState = 1; // before onopen: the handshake frames go out on the same stream
+        link.send = (text) => { writer.write(encoder.encode(text + "\n")).catch((e) => { if (link.onerror) link.onerror(e); }); };
+        link.close = () => { try { session.close(); } catch (e) { warn("session close failed:", e && e.message); } };
+        if (link.onopen) link.onopen();
+        let buffer = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          for (let end; (end = buffer.indexOf("\n")) >= 0;) {
+            const line = buffer.slice(0, end);
+            buffer = buffer.slice(end + 1);
+            if (line && link.onmessage) link.onmessage(line); // one frame per line, like the server writes them
+          }
+        }
+      } catch (e) {
+        if (link.readyState === 0) { warn("webtransport open failed:", (e && e.message) || e); if (link.onerror) link.onerror(e); }
+      }
+      link.readyState = 3;
+      if (link.onclose) link.onclose();
+    })();
+    return link;
+  }
+
+  function openLink(endpoint) {
+    return endpoint.transport === "websocket" ? webSocketLink(endpoint.url) : webTransportLink(endpoint.url);
+  }
+
   function send(frame) {
     if (!isOpen()) return false;
     try { sock.send(JSON.stringify(frame)); return true; } catch (e) { warn("send failed:", e && e.message); return false; }
@@ -334,9 +399,9 @@
   function connect() {
     closed = false;
     if (sock && (sock.readyState === 0 || sock.readyState === 1)) return;
-    if (!cfg.ws || !cfg.token) { warn("not connecting: missing " + (cfg.ws ? "session token" : "websocket url")); return; }
-    try { sock = new WebSocket(cfg.ws); }
-    catch (e) { warn("websocket open failed:", e && e.message); retryLater(); return; }
+    if (!cfg.endpoint || !cfg.token) { warn("not connecting: missing " + (cfg.endpoint ? "session token" : "live endpoint")); return; }
+    try { sock = openLink(cfg.endpoint); }
+    catch (e) { warn("open failed:", e && e.message); sock = null; retryLater(); return; }
     const s = sock;
     // hello {token, rev, pending}, then drain the offline queue (live.md §Protocol)
     s.onopen = () => {
@@ -344,9 +409,9 @@
       send({ t: "hello", token: cfg.token, rev: cfg.rev, pending: Array.from(pending.keys()) });
       flush();
     };
-    s.onmessage = (m) => onMessage(m && m.data);
+    s.onmessage = (data) => onMessage(data);
     s.onclose = () => { if (sock === s) sock = null; if (!closed) retryLater(); };
-    s.onerror = () => warn("socket error:", cfg.ws);
+    s.onerror = (e) => warn(s.kind + " error:", (e && e.message) || s.url);
   }
 
   function disconnect() {
@@ -372,9 +437,18 @@
     const first = (...vals) => { for (const v of vals) if (v != null) return v; return null; };
     // options beat page attributes, which beat the meta-tag JSON blob
     const pick = (key, name) => first(opts[key], ...sources.map((el) => el.getAttribute(name)), blob && blob[key]);
-    const token = pick("token", "data-z-token"), ws = pick("ws", "data-z-ws"), rev = Number(pick("rev", "data-z-rev") || 0);
+    const token = pick("token", "data-z-token"), ws = pick("ws", "data-z-ws"), wt = pick("wt", "data-z-wt"), rev = Number(pick("rev", "data-z-rev") || 0);
     cfg.token = token == null ? null : String(token);
-    cfg.ws = typeof ws === "string" && ws ? ws : (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host + "/zurtr/live";
+    // Endpoint precedence: an explicit WebTransport URL, then an explicit WebSocket URL (that
+    // endpoint selects the fallback transport), then the page's own origin as the WebTransport
+    // channel - https, or localhost/127.0.0.1 where the browser treats the origin as secure.
+    const wsUrl = typeof ws === "string" && ws ? ws : null;
+    const wtUrl = typeof wt === "string" && wt ? wt : null;
+    const secure = location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    if (wtUrl) cfg.endpoint = { transport: "webtransport", url: wtUrl };
+    else if (wsUrl) cfg.endpoint = { transport: "websocket", url: wsUrl };
+    else if (secure) cfg.endpoint = { transport: "webtransport", url: "https://" + location.host + LIVE_PATH };
+    else cfg.endpoint = { transport: "websocket", url: "ws://" + location.host + LIVE_PATH };
     cfg.rev = Number.isFinite(rev) ? Math.max(cfg.rev, rev) : cfg.rev; // never regress a revision we already saw
   }
 

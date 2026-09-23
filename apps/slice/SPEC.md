@@ -20,31 +20,30 @@ without a reload.
 
 ```sql
 create table users (
-  id         bigserial primary key,
+  id         integer primary key autoincrement,
   username   text not null unique,
-  created_at timestamptz not null default now()
+  created_at integer not null              -- microseconds since the epoch, UTC
 );
 create table tasks (
-  id         bigserial primary key,
-  user_id    bigint not null references users(id),
+  id         integer primary key autoincrement,
+  user_id    integer not null references users(id),
   title      text not null,
-  created_at timestamptz not null default now()
+  created_at integer not null
 );
 
 create table summaries (
-  task_id    bigint primary key references tasks(id),
+  task_id    integer primary key references tasks(id),
   body       text not null,
-  created_at timestamptz not null default now()
+  created_at integer not null
 );
 -- plus the framework's tables (zurtr_jobs, zurtr_schema_migrations)
 ```
 
-Dialect: this schema is PostgreSQL (`bigserial`, `timestamptz`, `bytea` in the
-tables below), and so are the `createdb` bootstrap and the `NOTIFY`-based wakeups
-the acceptance checks assume. The tree's only built adapter is Turso, which is
-SQLite-compatible (`src/data/turso_adapter.zig`, `docs/modules/data.md`), so
-either the slice moves to that dialect or the PostgreSQL adapter gets built —
-that choice has not been made.
+Dialect: Turso / SQLite, the adapter the tree builds (`decisions.md` D5/D6) —
+integer autoincrement keys, integer microsecond instants, `blob` for bytes, one
+writer per database file. Bootstrap is a temporary database file rather than
+`createdb`, and the delivery that used to be a notification is the outbox
+(`decisions.md` D4).
 
 ### Domain
 
@@ -71,7 +70,7 @@ that choice has not been made.
 ### Routes
 
 - `GET /tasks` → live page (initial HTML, session token).
-- `GET /zurtr/live` → WebSocket endpoint (the live transport).
+- `GET /zurtr/live` → the live channel: WebTransport over HTTP/3, with a WebSocket endpoint as the documented fallback (`decisions.md` D3).
 - `POST /zurtr/upload` → session-scoped upload endpoint (server side planned;
   the browser half is in `assets/zurtr_live.js`, which posts to
   `/zurtr/upload?token=…`, and its self-test page exercises it).
@@ -81,35 +80,35 @@ that choice has not been made.
 
 ## Acceptance checks (the e2e script)
 
-`zurtr test --e2e` boots the app against a temporary database
-(`createdb zurtr_slice_test_<pid>`, migrations applied) on an ephemeral port,
-drives it with an HTTP client and a minimal WebSocket client, then drops the
-database. Every check below is asserted; the script exits non-zero on the first
-failure and prints the failing check.
+`zurtr test --e2e` boots the app against a temporary database (a file under the
+test's scratch directory, migrations applied) on an ephemeral port, drives it
+with an HTTP client and a live-channel client, then deletes the file. Every
+check below is asserted; the script exits non-zero on the first failure and
+prints the failing check.
 
 1. **Initial render**: `GET /tasks` (with the session cookie) returns 200, HTML
    containing the task list and the session token; `GET /tasks` without the
    cookie redirects to `/login` (auth gate, not a 500).
-2. **Attach**: the WS client sends `hello` with the token and rev from the
+2. **Attach**: the live client sends `hello` with the token and rev from the
    HTML; the server replies `ready` and the client's `rev` advances.
 3. **Invalid form**: `submit` with title `"ab"` produces an `error` message
    with `kind=validation` and field key `title`/code `too_short`; the page
    patch does not add a task; the database has no new `tasks` row and no new
    `zurtr_jobs` row.
-4. **Anonymous denial**: a second WS session without the cookie cannot submit
+4. **Anonymous denial**: a second live session without the cookie cannot submit
    (connection is refused at attach, or the event returns `kind=authz`).
 5. **Valid form, atomic write**: `submit` with a valid title produces a patch
    adding the task; the database shows exactly one `tasks` row **and** one
    `zurtr_jobs` row for the same event. A deliberate failure case
    (`POST /debug/fail-after-task`, dev-only) rolls back both rows — asserted in
    the same run to prove the transaction, not the happy path, is the mechanism.
-6. **Job execution**: within 5 seconds a second patch arrives (pub/sub) adding
+6. **Job execution**: within 5 seconds a second patch arrives (the outbox and the bus) adding
    the summary line; `summaries` has exactly one row for the task; the job row
    is `completed`.
 7. **Idempotency**: re-running the job for the same task (via
    `POST /debug/replay-job`) does not create a second `summaries` row and does
    not publish a second patch (asserted by message count).
-8. **Reconnect**: the WS client drops the socket mid-session, reconnects with
+8. **Reconnect**: the live client drops the channel mid-session, reconnects with
    the last rev and pending event ids, and receives either continued patches or
    a `resync` whose HTML contains both the task and its summary; no event is
    applied twice (task count stable).
@@ -128,5 +127,5 @@ edit-to-DOM-paint < 1000 ms for both edits, recorded in
 ## Out of scope for the slice (tracked by module contracts)
 
 - Password/OAuth authentication (dev login stands in), upload UI, agent
-  workflows (the `agents` module has its own tests), non-PostgreSQL adapters,
-  TLS, HTTP/2, and multi-worker session affinity.
+  workflows (the `agents` module has its own tests), the declared PostgreSQL
+  adapter, TLS, HTTP/2, and multi-worker session affinity.

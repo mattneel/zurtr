@@ -3,7 +3,9 @@
 Vendored-tree design note (see `deps/zix/UPSTREAM.md`). Status: the transport
 half is implemented in zix; the framework-facing route and handler layer below
 is designed, not implemented. Written against the previously vendored swerver
-tree, which the transport swap removed.
+tree, which the transport swap removed. Ruled a fallback concern in
+`decisions.md` D8: WebTransport is the live channel, so the route kind and
+handler struct wait until the WebSocket fallback is actually used.
 
 ## What exists today (zix)
 

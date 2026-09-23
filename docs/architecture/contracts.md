@@ -4,37 +4,41 @@ Normative. Types named here are contracts, not final declarations; the
 semantics are what implementations must satisfy. Zig type names use the
 `zurtr.<module>` namespace (e.g. `zurtr.data.Tx`).
 
-Status: nothing in §1's parked and deferred classes is implemented in this tree
-(`overview.md` §Execution model records why: the park sentinel these rules were
-written against was swerver's, and zix has no counterpart). §3's adapter
-position and §2's transport row are stated against the tree; the rest of the
-document is the design the implemented modules (`data`, `live`, `runtime`) and
-the declared ones are held to.
+Status: the async lane and the deferred rules in §1 are the design this tree is
+held to; `overview.md` §Execution model records how they map onto zix, and
+`docs/architecture/decisions.md` records the rulings (D1 retires the park class,
+D2 confines deferral to `.ASYNC`). §3's adapter position is stated against the
+tree.
 
 ## 1. Execution
 
-Three classes, defined in `overview.md` §Execution model. Rules:
+Two classes, defined in `overview.md` §Execution model (the parked class the
+third name referred to is retired — `decisions.md` D1). Rules:
 
 1. **Handler context is borrowed.** `RequestView` slices, headers, params and
    the request arena are valid only for the duration of the handler call (or
-   the resumed continuation for parked requests). Nothing derived from them may
-   be stored in session state, job payloads, or agent state.
-2. **Park rules.** One park per request. Park stash is plain data
-   (`assertPlainData`-checked at comptime), fixed capacity, copied in and out.
-   A parked connection accepts no further requests and no reads are processed
-   for it.
-3. **Deferred handle rules.** A deferred handle owns its response data; the
-   producer allocates it and transfers ownership. Handles are validated
-   (worker, connection index, generation, request id) at completion. A dropped
-   handle is counted and ignored; it is never an error path that can crash the
-   worker.
+   the resumed continuation, for an operation in flight on the async lane).
+   Nothing derived from them may be stored in session state, job payloads, or
+   agent state.
+2. **Async lane rules.** A driver round trip parks the connection's fiber, not
+   the worker (`deps/zix/src/tcp/http1/context.zig`). The request buffer stays
+   valid across the yield. One in-flight operation per fiber; a connection with
+   an operation in flight processes no further reads for it, and resume produces
+   the response.
+3. **Deferred rules.** A deferred completion carries a handle
+   (`worker_id, conn_index, conn_generation, request_id`) and **owns** its
+   response data: the producer allocates it and transfers ownership, the
+   consumer validates the handle before writing and frees what it consumed. A
+   dropped handle is counted and ignored; it is never an error path that can
+   crash the worker. Deferral is confined to the `.ASYNC` lane until the
+   transport can wake the loop models (`decisions.md` D2).
 4. **Ordering.** Per connection, responses are written in completion order;
    the framework never reorders a connection's writes. Per session, event
    processing is serialized by the session owner; asynchronous operations
    complete into the owner's queue and are processed in arrival order.
-5. **No blocking.** Reactor-thread code must not perform blocking syscalls,
-   mutex waits, or unbounded computation. Anything that can wait is parked,
-   deferred, or moved to a worker role.
+5. **No blocking.** Loop-thread code must not perform blocking syscalls, mutex
+   waits, or unbounded computation. Anything that can wait runs in the async
+   lane or moves to a worker role.
 
 ## 2. Ownership and lifetimes
 
@@ -68,10 +72,10 @@ Rules:
 - `zurtr.data.Database`: `query`, `exec`, `begin`, `close`. Adapter
   implementations share this interface. Turso is the only built adapter, opened
   at one of four tiers (`docs/modules/data.md`); PostgreSQL is declared over
-  zix's `postgrez` driver and is not built. The parked execution mode §1
-  describes is therefore unbuilt for the data layer: it relied on an
-  event-loop-integrated client that parks on the reactor, and zix's `postgrez`
-  does not park that way.
+  zix's `postgrez` driver and is not built. Database calls from a handler run in
+  the async lane, where the fiber parks on the driver's `std.Io` round trip
+  (`decisions.md` D1); there is no reactor-parking client and none is being
+  built.
 - `zurtr.data.Tx`: scoped, not thread-safe, not storable. Acquired
   lexically (or by a surface that establishes one for an action). Nested
   scopes use savepoints. A tx that is neither committed nor rolled back at

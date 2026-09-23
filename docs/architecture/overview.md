@@ -22,17 +22,19 @@ one static executable.
 | --- | --- | --- | --- |
 | `runtime` (shared core) | Worker pool with work stealing and completion delivery, a bounded lock-free MPMC queue, a structured-task layer | zix | implemented: `src/runtime/` |
 | `data` | Queries, transactions, migrations, adapters | runtime, zix | implemented: the contract plus the Turso adapter at four tiers (`docs/modules/data.md`) |
-| `domain` | Resources, typed actions, validation, authorization, relationships | data, runtime | declared; `src/domain/{action,policy,validation}.zig` is in the tree but is not exported by `src/root.zig` |
+| `domain` | Resources, typed actions, validation, authorization, relationships | data, runtime | implemented: `src/domain/` (action, policy, validation); the inventory in `src/root.zig` is being updated to match (`decisions.md` D7) |
 | `live` | Session state, events, components, render/patch, DOM protocol | runtime, zix | implemented: `src/live/{protocol,pubsub,tree,patch}.zig` |
 | `jobs` | Durable queues, schedules, retries, concurrency, cancellation | data, domain (action refs), runtime | declared |
 | `agents` | Signals, decisions, effects, checkpoints, durable execution | data, domain, jobs, runtime | declared |
 | `app` | Config, routes, middleware, auth, lifecycle, telemetry; wires the rest | all of the above | declared |
 | `dev` | Incremental builds, reload, diagnostics, tests, inspection | build system; not linked into release apps | declared |
 
-The status column mirrors the `modules` table in `src/root.zig`, which is the
-tree's own inventory (`zurtr modules` prints it). *Declared* means this tree has
-the contract and no implementation; a module moves to *implemented* when its
-first real surface lands.
+The status column follows the `modules` table in `src/root.zig`, which is the
+tree's own inventory (`zurtr modules` prints it), and differs from it in exactly
+one place: `domain` has code in the tree while that table still says declared,
+and the table is the side being corrected (`decisions.md` D7). *Declared* means
+this tree has the contract and no implementation; a module moves to
+*implemented* when its first real surface lands.
 
 Optional layers: `script` (QuickJS-ng, `docs/modules/script.md`) and `zeex`
 (JSX lowered to Zig at build time by a script the build runs, `src/zeex/`) sit
@@ -72,36 +74,38 @@ and zero-copy in the loop models: request slices point into the receive buffer
 and the response body must be produced before the handler returns. In `.ASYNC`
 the request's `std.Io` is a yielding backend, so a driver round trip parks the
 connection's fiber instead of blocking the worker
-(`deps/zix/src/tcp/http1/context.zig`). zix has no park sentinel: the
-park/resume mechanism this section was written against belonged to swerver,
-which is no longer vendored.
+(`deps/zix/src/tcp/http1/context.zig`). zix has no park sentinel, and none is
+being built: see `decisions.md` D1.
 
-zurtr uses three execution classes. **None of them is implemented in this tree
-yet** — the three classes below are the design, and `runtime`'s pool, queue and
-task layer (`src/runtime/`) is the only execution machinery that exists.
+zurtr uses **two execution classes** (`docs/architecture/decisions.md` D1). The
+third — a park sentinel that handed one operation to an event-loop-integrated
+driver and resumed the connection from the loop — died with swerver and is not
+being rebuilt: the async lane provides the same property.
 
 1. **Synchronous** — routing, session lookup in memory, validation, render,
-   patch generation, fast DB ops via the parked path below. Runs on the reactor
-   thread. No heap allocation beyond the request arena and response buffers.
-2. **Parked (operation in flight)** — the handler hands off one in-flight
-   operation to an event-loop-integrated driver (Postgres I/O, timers) and
-   returns the park sentinel. The request buffer stays valid; the handoff state
-   is plain data (no pointers/slices) in a fixed stash, enforced at comptime.
-   One park per request. Resume runs on the reactor thread and produces the
-   response.
-3. **Deferred (application-completed)** — work that outlives the reactor's own
-   drivers (a job completing, an agent step, a pub/sub broadcast) retains an
-   explicit **connection handle**: `{worker_id, conn_index, conn_generation,
-   request_id}` plus **owned** response data. Completion is enqueued on the
-   worker's completion queue and signaled to the loop (via a registered wake fd
-   in the original design; zix offers no such hook, see
-   `docs/architecture/zix-deferred.md`); the loop drains the queue and,
-   validating the connection generation, writes the response or drops it. A
-   stale handle (connection closed/reused) is a no-op + counter increment, never
-   a use-after-free.
+   patch generation. Runs on the loop thread, or on the connection's fiber in
+   the async lane. No heap allocation beyond the request arena and response
+   buffers.
+2. **Async (operation in flight)** — the operation runs on the connection's
+   fiber in the `.ASYNC` lane: the request's `std.Io` yields on a driver round
+   trip, so the fiber parks and the worker keeps serving. The request buffer
+   stays valid across the yield, and the response is produced when the fiber
+   resumes. One in-flight operation per fiber; a connection with an operation in
+   flight processes no further reads for it.
 
-Everything that can be synchronous should be; parks are for single in-flight
-awaitables; deferred handles are for external completions and session fanout.
+**Deferred completions.** A result that originates outside the connection's own
+fiber — a job completing, an agent step, a pub/sub broadcast — is delivered
+inside the `.ASYNC` lane, where the parked fiber already has a resume point. The
+handle rules in `contracts.md` §1.3 still apply: `{worker_id, conn_index,
+conn_generation, request_id}` plus **owned** response data, validated at
+completion, and a stale handle (connection closed or reused) is a drop plus a
+counter increment, never a use-after-free. What does not exist is a way to wake
+the `.EPOLL` / `.URING` loops from another thread, so deferral is confined to
+`.ASYNC` for now; a transport-level wake source is the open item
+(`decisions.md` D2).
+
+Everything that can be synchronous should be; deferred delivery is for
+completions a fiber cannot produce itself.
 
 ### Sessions and worker affinity
 
@@ -134,8 +138,11 @@ is therefore a deployment choice (role processes, or one process per shard).
 
 ## Build and development model
 
-- Every module is a separate Zig module with explicit imports; an application
+- Every module is a separate Zig module with explicit imports, so an application
   compiles only the modules it uses (unreferenced modules are never analyzed).
+  This is the packaging **target**, not today's shape: `build.zig` currently
+  declares one `zurtr` module rooted at `src/root.zig`, with the vendored
+  dependencies as the only separate modules (`decisions.md` D9).
 - Build options are the framework's own and all default off: `-Dturso` /
   `-Dturso-sync` (the data adapter and its sync SDK Kit) and `-Dscript` (the
   QuickJS layer and the `zeex` compiler that runs on it). zix has no build-time
@@ -163,7 +170,7 @@ its migrations and the end-to-end script it names do not exist in this tree.
    connection; a session is created.
 2. A form submits; the event is validated and correlated to a typed domain
    action with an explicit principal.
-3. The action runs in one PostgreSQL transaction that (a) writes the domain
+3. The action runs in one database transaction that (a) writes the domain
    row and (b) inserts a durable job row, in the same commit.
 4. The job executes, its result is published on a pub/sub topic owned by the
    live runtime, and the affected UI region is patched.
@@ -171,9 +178,8 @@ its migrations and the end-to-end script it names do not exist in this tree.
    the latency target.
 
 Each numbered item is an acceptance check in the slice's end-to-end script.
-Storage: the slice is specified against PostgreSQL (`apps/slice/SPEC.md` —
-`bigserial`, `timestamptz`, `bytea`), while the tree's only built adapter is
-Turso, which is SQLite-compatible; the two do not agree yet.
+Storage: the slice is specified in the Turso/SQLite dialect, the only adapter
+the tree builds (`apps/slice/SPEC.md`, `decisions.md` D5/D6).
 
 ## Deferred / explicitly out of scope
 
@@ -181,15 +187,15 @@ Turso, which is SQLite-compatible; the two do not agree yet.
   (`deps/zix/src/tls/`, wired into its HTTP/1.1 server as `tls_serve`/`tls_mux`),
   so no OpenSSL is required for HTTPS. zurtr's own TLS surface (config,
   certificates, deployment) is unbuilt.
-- Parked and deferred execution (classes 2 and 3 above): designed, not
-  implemented. zix has no park sentinel to park against, and its HTTP/1.1
-  dispatch exposes no way for another thread to wake the loop
-  (`dispatch/epoll.zig` publishes only `runEpoll`); what zurtr uses instead is
-  an open call.
+- Parked execution: retired, not deferred — the async lane is the mechanism
+  (`decisions.md` D1). Deferred completions are confined to `.ASYNC` until the
+  transport can wake the loop models; that wake source is the open item (D2).
 - Adapters: Turso is the only built adapter, at four tiers. The PostgreSQL
   adapter is declared over zix's `postgrez` and is not built
   (`docs/modules/data.md`).
 - Connection migration of live sessions across workers (see above).
 - HTTP/2 (RFC 8441) WebSockets: HTTP/1.1 upgrade first (zix's own server
   serves WebSocket over HTTP/1.1; RFC 8441 appears only in zixer's edge bridge,
-  `deps/zix/src/zixer/http2_ws_bridge.zig`).
+  `deps/zix/src/zixer/http2_ws_bridge.zig`). WebSocket is the documented
+  fallback for the live channel; WebTransport is the channel (`decisions.md`
+  D3).

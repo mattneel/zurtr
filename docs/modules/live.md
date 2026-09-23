@@ -17,9 +17,12 @@ no session type in the tree yet.
    descriptor (view type, initial state, route) and renders the initial HTML
    with `live.tree`. The HTML carries the session token and per-element patch
    ids.
-2. **Attach.** The browser opens a WebSocket and sends `hello` with the token
-   and the client's last `rev`. The worker either attaches to the live session,
-   resumes from a serializable snapshot, or answers `resync`.
+2. **Attach.** The browser opens a **WebTransport** session to the live path and
+   sends `hello` with the token and the client's last `rev`. The worker either
+   attaches to the live session, resumes from a serializable snapshot, or
+   answers `resync`. A deployment that cannot serve HTTP/3 configures a
+   WebSocket endpoint instead, which is the documented fallback
+   (`decisions.md` D3).
 3. **Events.** Client event batches are decoded into the view's typed
    `Event` union. The session owner processes them serially. Each event is
    validated and authorized before the handler runs (§`contracts.md` §4).
@@ -56,7 +59,8 @@ What the broker is, precisely:
 - **Not durable, not transactional.** A publish with no subscribers is dropped, and one during a
   reconnect is gone. The durable path is the outbox: the event commits in the same transaction as the
   state change, and a view that missed events resyncs from a revisioned snapshot. `app` publishes *after*
-  the commit for the same reason — a subscriber must never act on a write that was rolled back.
+  the commit for the same reason — a subscriber must never act on a write that was rolled back
+  (`decisions.md` D4: there is no `pg_notify`, and the storage cannot provide one).
 
 This is also the seam distribution hangs off: the bus already carries "this happened" between a job, a
 session and an agent on one worker, and putting `data`'s tiers underneath it is what carries the same
@@ -133,6 +137,17 @@ express a change structurally degrades to `replace` of the nearest ancestor
 with a keyed or component boundary. An unchanged tree yields zero ops.
 
 ## Protocol (text frames, JSON; binary frames are a later optimization)
+
+**Channel.** WebTransport over HTTP/3, on the same origin as the page
+(`decisions.md` D3). Frames are the same text JSON either way; over WebTransport
+they are newline-delimited on one bidirectional stream — the convention zix's
+own examples use (`deps/zix/examples/tls/webtransport_live.html`) — and
+datagrams carry the notes that may be dropped. A `ws://` / `wss://` endpoint
+selects the **WebSocket fallback**, where one frame is one WebSocket message;
+the client never downgrades by itself. What the shipped self-test
+(`assets/zurtr_live_test.html`) exercises is the fallback — it stubs
+WebSocket — while the WebTransport channel has been exercised only to its
+opening handshake.
 
 Client → server:
 

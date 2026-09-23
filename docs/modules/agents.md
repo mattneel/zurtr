@@ -5,8 +5,8 @@ effects, checkpoints. Agents reuse `jobs` (execution) and `domain` (actions as
 tools); they add durable state and replay with recorded effects.
 
 Status: **declared** — no implementation in this tree (`src/root.zig`'s module
-table). The tables below are PostgreSQL-shaped, like `jobs.md`'s, and share its
-open question about the storage the framework actually has (`docs/modules/data.md`).
+table). The tables below are in the same dialect as `jobs.md`'s — Turso /
+SQLite, integer microseconds, single writer per database (`decisions.md` D5/D6).
 
 ## Model
 
@@ -37,33 +37,33 @@ Tables:
 
 ```sql
 create table zurtr_agent_runs (
-  id            bigserial primary key,
-  agent         text not null,
-  version       int  not null,
-  state         bytea not null,
-  status        text not null,      -- running|waiting|completed|failed|cancelled
-  step          int  not null default 0,
-  lease_until   timestamptz,
+  id            integer primary key autoincrement,
+  agent         text    not null,
+  version       integer not null,
+  state         blob    not null,
+  status        text    not null,      -- running|waiting|completed|failed|cancelled
+  step          integer not null default 0,
+  lease_until   integer,               -- microseconds since the epoch, UTC
   leased_by     text,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now()
+  created_at    integer not null,
+  updated_at    integer not null
 );
 create table zurtr_agent_steps (
-  run_id        bigint not null references zurtr_agent_runs(id),
-  step          int    not null,
-  signal        bytea  not null,    -- serialized Signal
-  decision      bytea  not null,    -- serialized Decision
-  effect_status text   not null,    -- pending|succeeded|failed
-  effect_result bytea,              -- recorded result, replayed on recovery
-  inserted_at   timestamptz not null default now(),
+  run_id        integer not null references zurtr_agent_runs(id),
+  step          integer not null,
+  signal        blob    not null,      -- serialized Signal
+  decision      blob    not null,      -- serialized Decision
+  effect_status text    not null,      -- pending|succeeded|failed
+  effect_result blob,                  -- recorded result, replayed on recovery
+  inserted_at   integer not null,
   primary key (run_id, step)
 );
 create table zurtr_agent_signals (
-  id       bigserial primary key,
-  run_id   bigint not null,
-  payload  bytea  not null,
-  state    text   not null default 'pending', -- pending|delivered
-  inserted_at timestamptz not null default now()
+  id       integer primary key autoincrement,
+  run_id   integer not null,
+  payload  blob    not null,
+  state    text    not null default 'pending', -- pending|delivered
+  inserted_at integer not null
 );
 ```
 
@@ -72,15 +72,17 @@ create table zurtr_agent_signals (
   recovery re-reads `zurtr_agent_steps`; steps with `effect_status=succeeded`
   are applied from `effect_result` without re-issuing the effect
   (`contracts.md` §5).
-- The run row is the lease/lock: a worker claims a run with the same
-  `FOR UPDATE SKIP LOCKED` discipline as jobs (separate queue,
-  `zurtr_agents`), so two workers never decide concurrently for one run.
+- The run row is the lease/lock: a worker claims a run with the same claim
+  discipline as jobs — one statement inside a write transaction (separate queue,
+  `zurtr_agents`) — so two workers never decide concurrently for one run.
 - `apply` must be deterministic given `(state, effect_result)`; it must not
   perform I/O. All I/O happens in effects (actions, or explicit `effect`
   declarations executed by the runner with recorded results).
 - Signals are durable: `sendSignal(run_id, signal)` inserts into
-  `zurtr_agent_signals` (and `NOTIFY`), and the runner delivers pending signals
-  in id order. `waiting` runs wake on signal arrival.
+  `zurtr_agent_signals`, and the runner delivers pending signals in id order.
+  A `waiting` run wakes on the next poll tick — the storage has no notification
+  channel (`decisions.md` D4/D5), so what a signal gets instead of a wake-up is
+  a row that cannot be lost.
 - Versioned transitions: a run records `version`; the runner executes the
   workflow code for that version. New versions apply to new runs;
   migrating a live run is an explicit recorded operation, never implicit.

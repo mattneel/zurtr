@@ -3,8 +3,11 @@
 //! Execution path for work that must not run on the reactor thread: blocking
 //! database operations for live sessions, agent steps, and job bodies when a
 //! role runs in-process. Work items run on pool threads; results are pushed to
-//! a bounded completion queue that the reactor drains (waking it via the
-//! transport's wake fd). See `docs/architecture/contracts.md` §1.
+//! a bounded completion queue that the consumer drains — in the `.ASYNC` lane
+//! that consumer is the connection's fiber, which a completion resumes
+//! (`docs/architecture/decisions.md` D2). There is no transport wake fd: the
+//! `.EPOLL` / `.URING` loops cannot be woken from another thread yet.
+//! See `docs/architecture/contracts.md` §1.
 //!
 //! Contract:
 //! - `submit` never blocks the caller beyond a bounded queue push; when

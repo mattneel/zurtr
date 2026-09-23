@@ -69,19 +69,18 @@ pub const Config = struct {
   `run`, and maps the result per surface. One implementation, three surfaces —
   no per-surface copies of domain logic.
 - **Pub/sub**: live sessions subscribe to topics
-  (`pubsub.subscribe(:invoice, id)`); `app` publishes after committed writes
-  (`pubsub.publish(tx, topic, payload)` → a transactional notification, delivery
-  after commit). Subscribers receive `Info` messages on the session owner
-  thread.
+  (`pubsub.subscribe(:invoice, id)`); a committed write publishes to the
+  worker-local broker for the subscribers that are *present*, and records the
+  event in the **outbox** in the same transaction as the state change. The
+  outbox is the durable path; the broker is fan-out, and a view that missed
+  events resyncs from a revisioned snapshot (`decisions.md` D4,
+  `docs/modules/live.md`). Subscribers receive `Info` messages on the session
+  owner thread.
 
-  The tree's bus (`src/live/pubsub.zig`) is the worker-local broker — publish
-  and subscribe, no transaction and no database. The transactional form above
-  has nowhere to go today: the only built adapter is Turso, which is
-  SQLite-compatible and has no `LISTEN`/`NOTIFY`, and zix's `postgrez` driver
-  (which does have it, `deps/zix/src/driver/postgrez/src/notify.zig`) backs no
-  built adapter. The durable substitute is the outbox described in
-  `docs/modules/live.md` and `docs/modules/data.md`; which one `app` uses is
-  unresolved.
+  There is no `pg_notify` anywhere: the only built adapter is Turso, which is
+  SQLite-compatible and has no `LISTEN`/`NOTIFY`. zix's `postgrez` driver does
+  have it (`deps/zix/src/driver/postgrez/src/notify.zig`), but it backs no built
+  adapter.
 - **Jobs bridge**: `jobs` runs in its role process; the web role enqueues.
   Job completion that must reach a live session is published through pub/sub
   (the slice uses exactly this path).

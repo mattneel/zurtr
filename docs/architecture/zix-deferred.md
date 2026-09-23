@@ -3,8 +3,9 @@
 Vendored-tree design note (see `deps/zix/UPSTREAM.md`). Status: designed, not
 implemented. Written against the previously vendored swerver tree, which the
 transport swap removed; the requirement it encodes is still the framework's —
-the mechanism is not. See `overview.md` §Execution model (class 3) and
-`contracts.md` §1.3 for the rules a producer and consumer must satisfy.
+the mechanism is not. See `overview.md` §Execution model,
+`docs/architecture/decisions.md` (D1, D2) and `contracts.md` §1.3 for the rules
+a producer and consumer must satisfy.
 
 ## What exists today (zix)
 
@@ -104,17 +105,16 @@ post-dispatch hook the WebSocket promotion uses.
   closed. Connection close while deferred: the handle is invalidated
   (generation/id check does the work); the completion is dropped.
 
-**Wake path — the open call**
+**Wake path**
 
-This is the piece with no zix counterpart: the designs above assume a
-loop-integrated wake source, and zix's HTTP/1.1 loops have none. Two shapes fit
-the tree as it stands, and neither is chosen here:
-
-- zix grows a wake source for its loops (an external fd registered with the
-  epoll/uring loops, or a turn-interval poll), and the deferred class works in
-  every model; or
-- the deferred class is confined to `.ASYNC`, where a driver round trip already
-  parks the connection's fiber and a completion is just a resume.
+Settled by `decisions.md` D2: deferred completions are delivered inside the
+`.ASYNC` lane, where a driver round trip already parks the connection's fiber,
+so a completion is a resume and no wake source is required. A transport-level
+wake source for the `.EPOLL` / `.URING` loops (an external fd registered with
+the loop, or a turn-interval poll) is the future path, not this pass: zix's
+HTTP/1.1 dispatch exposes no way for another thread to wake a loop today —
+`runEpoll` / `runAsync` are the entry points, and there is no external-fd
+registration, no eventfd and no completion queue in the tree.
 
 ## Integration points
 
@@ -130,8 +130,9 @@ touches are:
 | `deps/zix/src/tcp/http1/context.zig` | the per-request context |
 | `deps/zix/src/lib.zig` | the transport's exported surface |
 
-Where a deferred reservation is honored, and how the wake path resolves, are
-decisions this note deliberately leaves open.
+Where a deferred reservation is honored is still open. The wake path is not:
+deferral lives in the `.ASYNC` lane until the transport can wake the loop
+models (`decisions.md` D2).
 
 ## Tests
 
