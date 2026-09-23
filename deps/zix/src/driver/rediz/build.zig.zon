@@ -1,0 +1,12 @@
+.{
+    .name = .rediz,
+    .version = "0.1.0",
+    .fingerprint = 0x02f968b35ed15c01, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+    },
+}

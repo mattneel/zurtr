@@ -1,4 +1,4 @@
-//! zurtr — a native application framework built on swerver.
+//! zurtr — a native application framework built on zix.
 //!
 //! Seven modules, compiled only when used:
 //!   Application, Live UI, Domain, Data, Jobs, Agents, Development.
@@ -8,11 +8,57 @@
 
 const std = @import("std");
 
-/// Vendored swerver transport (deps/swerver). Re-exported so applications and
-/// modules above the framework can reach transport types without a direct
-/// dependency on the vendored path.
-pub const swerver = @import("swerver");
+/// Vendored zix transport (deps/zix): HTTP/1.1 and HTTP/3 on one origin, WebTransport for the live
+/// channel, and the in-tree drivers (`postgrez`, `rediz`) the data module builds on. Re-exported so
+/// applications and modules above the framework can reach transport types without a direct dependency
+/// on the vendored path.
+pub const zix = @import("zix");
 
-test "zurtr module builds and links swerver" {
-    try std.testing.expect(@sizeOf(swerver.response.Response) > 0);
+/// Shared runtime primitives (ownership, pools, ids, clocks).
+pub const runtime = struct {
+    pub const pool = @import("runtime/pool.zig");
+};
+
+/// Live UI: session state, events, render/patch, protocol.
+pub const live = struct {
+    pub const protocol = @import("live/protocol.zig");
+};
+
+/// What this build contains, for `zurtr modules` and `zurtr build --report`.
+///
+/// The architecture names eight modules; this table says which of them exist in
+/// the tree and which are still declarations. It is a status report, not a
+/// feature list: a module moves to `.implemented` when its first real surface
+/// lands, and the inventory is read from here rather than maintained twice.
+pub const Module = struct {
+    name: []const u8,
+    state: State,
+    surface: []const u8,
+
+    pub const State = enum {
+        /// Declared in `docs/architecture/overview.md` only.
+        declared,
+        /// Has real code in the tree, named in `surface`.
+        implemented,
+    };
+};
+
+pub const modules = [_]Module{
+    .{ .name = "runtime", .state = .implemented, .surface = "pool" },
+    .{ .name = "live", .state = .implemented, .surface = "protocol" },
+    .{ .name = "data", .state = .declared, .surface = "adapter interface; PostgreSQL and Turso adapters" },
+    .{ .name = "domain", .state = .declared, .surface = "resources, typed actions, validation, authorization" },
+    .{ .name = "jobs", .state = .declared, .surface = "durable queues, schedules, retries, cancellation" },
+    .{ .name = "agents", .state = .declared, .surface = "signals, decisions, effects, checkpoints" },
+    .{ .name = "app", .state = .declared, .surface = "config, routes, middleware, auth, lifecycle" },
+    .{ .name = "dev", .state = .declared, .surface = "incremental builds, reload, diagnostics, tests" },
+};
+
+test "zurtr module builds and links the transport" {
+    try std.testing.expect(@sizeOf(zix.Http.Request) > 0);
+}
+
+test {
+    _ = runtime.pool;
+    _ = live.protocol;
 }

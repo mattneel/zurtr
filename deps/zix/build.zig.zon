@@ -1,0 +1,22 @@
+.{
+    .name = .zix,
+    .version = "0.5.0",
+    .user_agent = "zix/0.5.0",
+    .date_release = "20260817",
+    // Changing this has security and trust implications.
+    .fingerprint = 0x4cc61d74dc93a20b,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "zix-build-tests.zig",
+        "zix-build-examples.zig",
+        "zix-build-test_runner.zig",
+        "zixer-build.zig",
+        "zixer-build-tests.zig",
+        "zixer-build-examples.zig",
+        "zixer-build-test_runner.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+    },
+}

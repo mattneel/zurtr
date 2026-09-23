@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zurtr live client tests</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 16px; background: #101014; color: #e8e8ee; }
+  #results div { padding: 1px 4px; white-space: pre-wrap; }
+  .pass { color: #6fd06f; }
+  .fail { color: #ff6b6b; }
+  .info { color: #8a8fa3; }
+  .summary { margin-top: 10px; font-weight: 700; }
+  #sandbox { border: 1px dashed #3a3a44; padding: 8px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<div id="results"></div>
+<div id="sandbox"></div>
+<script src="zurtr_live.js"></script>
+<script>
+/* zurtr live bridge self-test: stubs WebSocket, drives the real client through the frozen protocol.
+   Normal mode runs the suite. `?bogus=1` instead points the client at a dead socket to prove the
+   reconnect backoff never raises and at most warns. */
+(function () {
+  "use strict";
+  const results = document.getElementById("results");
+  const ZL = window.ZurtrLive;
+  const cases = [];
+  const test = (name, fn) => cases.push({ name, fn });
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms === undefined ? 0 : ms));
+  let passed = 0, failed = 0, uncaught = 0;
+
+  function line(cls, text) {
+    const d = document.createElement("div");
+    d.className = cls;
+    d.textContent = text;
+    results.appendChild(d);
+  }
+  function assert(cond, msg) { if (!cond) throw new Error(msg || "assertion failed"); }
+  function eq(actual, expected, msg) {
+    const a = JSON.stringify(actual), b = JSON.stringify(expected);
+    if (a !== b) throw new Error((msg || "not equal") + " -- got " + a + " want " + b);
+  }
+  window.addEventListener("error", (e) => { uncaught++; line("fail", "UNCAUGHT " + e.message); });
+
+  /* ---------- stubbed WebSocket: records frames, replays scripted server frames ---------- */
+  const sockets = [];
+  function StubSocket(url) {
+    this.url = url; this.readyState = 0; this.sent = []; this.closed = false;
+    sockets.push(this);
+    setTimeout(() => { if (this.readyState === 0) { this.readyState = 1; if (this.onopen) this.onopen({}); } }, 0);
+  }
+  StubSocket.prototype.send = function (d) { this.sent.push(String(d)); };
+  StubSocket.prototype.close = function () { this.readyState = 3; this.closed = true; if (this.onclose) this.onclose({ code: 1000, wasClean: true }); };
+  StubSocket.prototype.push = function (m) { if (this.onmessage) this.onmessage({ data: typeof m === "string" ? m : JSON.stringify(m) }); };
+  StubSocket.prototype.cut = function () { this.readyState = 3; if (this.onclose) this.onclose({ code: 1006 }); };
+  StubSocket.prototype.last = function () { return this.sent[this.sent.length - 1]; };
+  const live = () => sockets[sockets.length - 1];
+  const frames = (s) => (s ? s.sent.map((f) => { try { return JSON.parse(f); } catch (e) { return null; } }) : []);
+  const ofType = (t) => frames(live()).filter((f) => f && f.t === t);
+  const lastAck = () => ofType("ack").pop();
+  const sandbox = () => {
+    let el = document.getElementById("sandbox");
+    if (!el || !el.isConnected) { el = document.createElement("div"); el.id = "sandbox"; document.body.appendChild(el); }
+    return el;
+  };
+  const mount = (html) => { const s = sandbox(); s.innerHTML = html; return s; };
+  const byId = (id) => document.querySelector('[data-z="' + id + '"]');
+
+  /* ---------- cases ---------- */
+
+  test("api: version + ready promise + exact hello frame", async () => {
+    assert(typeof ZL.version === "string" && ZL.version.length > 0, "version is a non-empty string");
+    assert(ZL.ready instanceof Promise, "ready is a Promise");
+    for (const k of ["start", "applyOps", "connect", "disconnect", "sendEvent", "flush"]) {
+      assert(typeof ZL[k] === "function", "public API missing " + k);
+    }
+    await tick(5);
+    eq(live().url, "ws://stub/live", "socket url came from start() options");
+    eq(live().sent[0], JSON.stringify({ t: "hello", token: "tok", rev: 1, pending: [] }), "exact hello frame");
+    live().push({ t: "ready", rev: 1, resume: false });
+    assert((await ZL.ready) === ZL, "ready resolves with the api after the first ready frame");
+  });
+
+  test("ops: text writes the element's text child", () => {
+    const s = mount('<p data-z="10">hello</p><p data-z="11"></p>');
+    const p = byId(10), text = p.firstChild;
+    eq(ZL.applyOps(s, [{ op: "text", id: 10, value: "world" }]), { applied: 1, skipped: 0 }, "summary");
+    eq(p.textContent, "world", "textContent rewritten");
+    assert(p.firstChild === text, "the existing text node is reused, not replaced");
+    eq(ZL.applyOps(s, [{ op: "text", id: 11, value: "fresh" }]), { applied: 1, skipped: 0 }, "summary");
+    eq(byId(11).textContent, "fresh", "text child created when the element has none");
+  });
+
+  test("ops: attr set and null-remove", () => {
+    const s = mount('<div data-z="12"></div>');
+    const el = byId(12);
+    eq(ZL.applyOps(s, [{ op: "attr", id: 12, name: "title", value: "a" }]), { applied: 1, skipped: 0 }, "set");
+    eq(el.getAttribute("title"), "a", "attribute set");
+    eq(ZL.applyOps(s, [{ op: "attr", id: 12, name: "title", value: null }]), { applied: 1, skipped: 0 }, "remove");
+    assert(!el.hasAttribute("title"), "null value removes the attribute");
+  });
+
+  test("ops: replace swaps the element by outerHTML", () => {
+    const s = mount('<div data-z="20"><em data-z="21">old</em></div>');
+    eq(ZL.applyOps(s, [{ op: "replace", id: 20, html: '<p data-z="22">new</p>' }]), { applied: 1, skipped: 0 }, "summary");
+    assert(byId(20) === null, "the old id is gone");
+    eq(byId(22).textContent, "new", "the replacement carries a fresh id");
+    assert(s.firstElementChild.tagName === "P", "the replacement took the old position");
+  });
+
+  test("ops: insert places html at the child index", () => {
+    const s = mount('<ul data-z="30"><li data-z="31">a</li><li data-z="32">c</li></ul>');
+    eq(ZL.applyOps(s, [{ op: "insert", parent: 30, index: 1, html: '<li data-z="33">b</li>' }]), { applied: 1, skipped: 0 }, "summary");
+    eq([...s.querySelectorAll("li")].map((li) => li.textContent), ["a", "b", "c"], "inserted at index 1");
+    eq(ZL.applyOps(s, [{ op: "insert", parent: 30, index: 99, html: '<li data-z="34">d</li>' }]), { applied: 1, skipped: 0 }, "summary");
+    eq([...s.querySelectorAll("li")].map((li) => li.textContent), ["a", "b", "c", "d"], "an out-of-range index appends");
+  });
+
+  test("ops: move reorders children (keyed identity survives)", () => {
+    const s = mount('<ul data-z="40"><li data-z="41" key="a">A</li><li data-z="42" key="b">B</li><li data-z="43" key="c">C</li></ul>');
+    const a = byId(41);
+    eq(ZL.applyOps(s, [{ op: "move", id: 41, parent: 40, index: 2 }]), { applied: 1, skipped: 0 }, "summary");
+    eq([...s.querySelectorAll("li")].map((li) => li.getAttribute("key")), ["b", "c", "a"], "A moved to the end");
+    assert(byId(41) === a && a.textContent === "A", "the same node moved, identity and content intact");
+    eq(ZL.applyOps(s, [{ op: "move", id: 41, parent: 40, index: 0 }]), { applied: 1, skipped: 0 }, "summary");
+    eq([...s.querySelectorAll("li")].map((li) => li.getAttribute("key")), ["a", "b", "c"], "A moved back to the front");
+    const t = mount('<div data-z="50"><span data-z="51">x</span></div><div data-z="52"></div>');
+    eq(ZL.applyOps(t, [{ op: "move", id: 51, parent: 52, index: 0 }]), { applied: 1, skipped: 0 }, "summary");
+    eq(byId(52).firstElementChild, byId(51), "moved across parents");
+    assert(byId(50).childElementCount === 0, "the old parent no longer holds it");
+  });
+
+  test("ops: remove drops the element", () => {
+    const s = mount('<div data-z="60"><p data-z="61">x</p><p data-z="62">y</p></div>');
+    eq(ZL.applyOps(s, [{ op: "remove", id: 61 }]), { applied: 1, skipped: 0 }, "summary");
+    assert(byId(61) === null, "element removed");
+    eq(s.querySelectorAll("p").length, 1, "the sibling is untouched");
+  });
+
+  test("ops: unknown kinds and malformed ops are skipped, never thrown", () => {
+    const s = mount('<div data-z="70">keep</div>');
+    const summary = ZL.applyOps(s, [
+      { op: "frobnicate", id: 70 },            // unknown kind
+      { op: "text" },                          // no id
+      null, "nonsense", { noop: true },         // not op objects
+      { op: "attr", id: 999, name: "x", value: "y" }, // unknown target id
+      { op: "text", id: 70, value: "patched" },       // still applied
+    ]);
+    eq(summary, { applied: 1, skipped: 6 }, "one applied, six skipped");
+    eq(byId(70).textContent, "patched", "the valid op in the same batch still applied");
+    eq(ZL.applyOps(s, "not-an-array"), { applied: 0, skipped: 0 }, "non-array ops is a no-op summary");
+    eq(ZL.applyOps(s, []), { applied: 0, skipped: 0 }, "empty batch is a no-op summary");
+  });
+
+  test("focus: focus and selection survive a patch", () => {
+    const s = mount('<input data-z="80" value="abcdef"><div data-z="82"><p data-z="81">t</p></div>');
+    const input = byId(80);
+    input.focus();
+    input.setSelectionRange(2, 4);
+    assert(document.activeElement === input, "input focused before the patch");
+    eq(ZL.applyOps(s, [{ op: "text", id: 81, value: "changed" }, { op: "insert", parent: 82, index: 0, html: "<i data-z=83>x</i>" }]),
+       { applied: 2, skipped: 0 }, "patched around the focused input");
+    assert(document.activeElement === input, "focus restored by identity");
+    eq([input.selectionStart, input.selectionEnd], [2, 4], "selection restored");
+    eq(byId(83).textContent, "x", "the patch landed");
+  });
+
+  test("focus: never restored into a replaced or removed element", () => {
+    const s = mount('<input data-z="90" value="q">');
+    const input = byId(90);
+    input.focus();
+    assert(document.activeElement === input, "focused before the patch");
+    eq(ZL.applyOps(s, [{ op: "replace", id: 90, html: '<input data-z="91" value="q">' }]), { applied: 1, skipped: 0 }, "replaced");
+    assert(!input.isConnected, "the old node is detached");
+    assert(document.activeElement !== input, "focus did not return to the replaced node");
+    const t = mount('<input data-z="92"><p data-z="93">x</p>');
+    const i2 = byId(92);
+    i2.focus();
+    eq(ZL.applyOps(t, [{ op: "remove", id: 92 }]), { applied: 1, skipped: 0 }, "removed");
+    assert(!i2.isConnected && document.activeElement !== i2, "focus did not return to the removed node");
+  });
+
+  test("forms: uncommitted value survives an unrelated patch", () => {
+    const s = mount('<form><input data-z="100" name="title" value="rendered"></form><div data-z="101">x</div>');
+    const input = byId(100);
+    input.value = "typed"; // an uncommitted edit
+    eq(ZL.applyOps(s, [
+      { op: "text", id: 101, value: "y" },
+      { op: "attr", id: 100, name: "class", value: "hot" },
+      { op: "insert", parent: 101, index: 0, html: "<b data-z=102>n</b>" },
+    ]), { applied: 3, skipped: 0 }, "summary");
+    eq(input.value, "typed", "uncommitted value preserved");
+    eq(input.getAttribute("class"), "hot", "other attributes of the same element still patch");
+    eq(input.getAttribute("value"), "rendered", "the value attribute is untouched");
+  });
+
+  test("forms: a value-attribute patch overwrites the uncommitted value", () => {
+    const s = mount('<form><input data-z="110" name="title" value="rendered"></form>');
+    const input = byId(110);
+    input.value = "typed";
+    input.focus();
+    input.setSelectionRange(1, 3);
+    eq(ZL.applyOps(s, [{ op: "attr", id: 110, name: "value", value: "server" }]), { applied: 1, skipped: 0 }, "summary");
+    eq(input.value, "server", "the server rewrite won (a bare setAttribute would have kept 'typed')");
+    assert(document.activeElement === input, "focus stayed on the input");
+  });
+
+  test("forms: the patch forms map forces values", () => {
+    const s = mount('<form><input data-z="120" name="title" value="rendered"><input data-z="121" name="q" value="zz"></form>');
+    const title = byId(120), q = byId(121);
+    title.value = "typed";
+    q.value = "typed-q";
+    eq(ZL.applyOps(s, [{ op: "attr", id: 120, name: "class", value: "k" }], { title: "forced" }),
+       { applied: 1, skipped: 0 }, "applyOps forms argument");
+    eq(title.value, "forced", "named field forced");
+    eq(q.value, "typed-q", "other fields keep their uncommitted value");
+    q.value = "typed-q2";
+    live().push({ t: "patch", rev: 3, ops: [{ op: "text", id: 121, value: "" }], forms: { q: "forced-q" } });
+    eq(q.value, "forced-q", "forms map from the patch frame forces the value");
+    eq(lastAck(), { t: "ack", rev: 3 }, "the patch was acked");
+  });
+
+  test("events: data-z-ev click batches one exact frame", async () => {
+    mount(`<form data-z="130"><input name="title" value="hello"><input name="qty" type="number" value="3">
+      <button type="button" data-z="131" data-z-ev="inc" data-z-val='{"n":2}'>go</button></form>`);
+    const before = live().sent.length;
+    byId(131).click();
+    eq(live().sent.length, before, "nothing is sent before the 10 ms flush timer");
+    await tick(30);
+    eq(live().sent.length, before + 1, "exactly one batched frame");
+    const frame = JSON.parse(live().last());
+    eq(frame.t, "events", "frame type");
+    eq(frame.batch.length, 1, "one event in the batch");
+    const ev = frame.batch[0];
+    assert(Number.isInteger(ev.id) && ev.id > 0, "client-generated integer event id");
+    eq(ev.ev, "inc", "event name from data-z-ev");
+    eq(ev.payload, { n: 2, title: "hello", qty: "3" }, "data-z-val merged with the form's named fields");
+    eq(live().last(), JSON.stringify({ t: "events", batch: [{ id: ev.id, ev: "inc", payload: { n: 2, title: "hello", qty: "3" } }] }),
+       "exact frame serialization");
+  });
+
+  test("events: data-z-change is debounced to one send", async () => {
+    mount('<input data-z="140" name="q" data-z-change="search" value="">');
+    const input = byId(140);
+    const before = live().sent.length;
+    input.value = "ab";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.value = "abc";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await tick(60);
+    eq(live().sent.length, before, "no frame inside the 100 ms debounce window");
+    await tick(140);
+    eq(live().sent.length, before + 1, "two changes produced exactly one frame");
+    const frame = JSON.parse(live().last());
+    eq(frame.batch[0].ev, "search", "event name from data-z-change");
+    eq(frame.batch[0].payload, { q: "abc" }, "the latest value wins");
+  });
+
+  test("events: data-z-key sends on Enter only", async () => {
+    mount('<input data-z="150" data-z-key="go" value="k">');
+    const input = byId(150);
+    const before = live().sent.length;
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    await tick(30);
+    eq(live().sent.length, before, "non-Enter keys send nothing");
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await tick(30);
+    eq(live().sent.length, before + 1, "Enter sent one frame");
+    const frame = JSON.parse(live().last());
+    eq(frame.batch[0].ev, "go", "event name from data-z-key");
+    eq(frame.batch[0].payload, { value: "k" }, "payload from the control");
+  });
+
+  test("events: data-z-form collects named fields and prevents the default", async () => {
+    mount(`<form data-z-form="save"><input name="title" value="t1"><input name="done" type="checkbox" checked>
+      <select name="pick"><option value="a">a</option><option value="b" selected>b</option></select>
+      <input name="off" disabled value="d"></form>`);
+    const form = sandbox().querySelector("form");
+    const before = live().sent.length;
+    const ev = new Event("submit", { bubbles: true, cancelable: true });
+    form.dispatchEvent(ev);
+    assert(ev.defaultPrevented, "the client owns the submit and prevented the default");
+    await tick(30);
+    eq(live().sent.length, before + 1, "one batched frame");
+    const frame = JSON.parse(live().last());
+    eq(frame.batch[0].ev, "save", "event name from data-z-form");
+    eq(frame.batch[0].payload, { title: "t1", done: true, pick: "b" }, "named enabled fields only");
+  });
+
+  test("ack: patch acks drop pending and the client acks the new rev", async () => {
+    const ids = ofType("events").reduce((acc, f) => acc.concat(f.batch.map((b) => b.id)), []);
+    assert(ids.length >= 4, "earlier cases produced pending events (" + ids.length + ")");
+    const before = live().sent.length;
+    live().push({ t: "patch", rev: 7, ops: [], acks: ids });
+    eq(live().sent.length, before + 1, "the patch is answered with exactly one frame");
+    eq(live().last(), JSON.stringify({ t: "ack", rev: 7 }), "exact ack frame carrying the new rev");
+    live().cut();
+    await tick(250);
+    const hello = JSON.parse(live().sent[0]);
+    eq(hello.t, "hello", "reconnect sent hello");
+    eq(hello.rev, 7, "hello carries the revision from the patch");
+    eq(hello.pending, [], "acked events are not resent");
+  });
+
+  test("reconnect: hello presents pending ids and ready(resume) resends them", async () => {
+    const id = ZL.sendEvent("after-reconnect", { k: 1 });
+    ZL.flush();
+    const first = live();
+    eq(JSON.parse(first.last()).batch, [{ id: id, ev: "after-reconnect", payload: { k: 1 } }], "event sent exactly once");
+    first.cut();
+    await tick(250);
+    const s2 = live();
+    assert(s2 !== first, "a new socket was opened by the backoff loop");
+    const hello = JSON.parse(s2.sent[0]);
+    eq(hello.t, "hello", "hello on the new socket");
+    eq(hello.pending, [id], "the unacked id is presented");
+    s2.push({ t: "ready", rev: hello.rev, resume: true });
+    const resent = frames(s2).filter((f) => f.t === "events");
+    eq(resent.length, 1, "one resend frame after ready(resume:true)");
+    eq(resent[0].batch, [{ id: id, ev: "after-reconnect", payload: { k: 1 } }], "same id, name and payload resent");
+    s2.push({ t: "patch", rev: hello.rev, ops: [], acks: [id] });
+  });
+
+  test("reconnect: ready(resume:false) drops pending events", async () => {
+    const id = ZL.sendEvent("dropped", {});
+    ZL.flush();
+    live().cut();
+    await tick(250);
+    const s1 = live();
+    eq(JSON.parse(s1.sent[0]).pending, [id], "pending presented before the server answers");
+    s1.push({ t: "ready", rev: JSON.parse(s1.sent[0]).rev, resume: false });
+    eq(frames(s1).filter((f) => f.t === "events").length, 0, "nothing resent when the session was not resumed");
+    s1.cut();
+    await tick(250);
+    eq(JSON.parse(live().sent[0]).pending, [], "pending dropped");
+  });
+
+  test("resync: replaces the body, tracks rev, keeps delegation and ids", async () => {
+    const keep = results;
+    const before = live().sent.length;
+    live().push({ t: "resync", rev: 9, html: '<div id="sandbox"><p data-z="200">resync mark</p>' +
+      '<button type="button" data-z="201" data-z-ev="after-resync">go</button></div>' });
+    assert(document.body.textContent.indexOf("resync mark") >= 0, "body replaced with the server html");
+    assert(document.getElementById("results") === null, "the old body content is gone");
+    document.body.appendChild(keep);
+    eq(live().sent.length, before, "a resync itself sends nothing");
+    live().push({ t: "patch", rev: 10, ops: [{ op: "text", id: 200, value: "after resync" }] });
+    eq(byId(200).textContent, "after resync", "patched by id after the body swap");
+    eq(lastAck(), { t: "ack", rev: 10 }, "rev updated from the resync and the patch");
+    const beforeClick = live().sent.length;
+    byId(201).click();
+    await tick(30);
+    eq(live().sent.length, beforeClick + 1, "delegation still installed after the swap");
+    const frame = JSON.parse(live().last());
+    eq(frame.batch[0].ev, "after-resync", "click captured in the new body");
+    live().push({ t: "patch", rev: 11, ops: [], acks: [frame.batch[0].id] });
+  });
+
+  test("error: zurtr:error on the form and focus on the first invalid field", async () => {
+    mount('<form data-z-form="save2"><input data-z="210" name="title" value=""><input data-z="211" name="qty" value=""></form>');
+    const form = sandbox().querySelector("form");
+    const title = byId(210);
+    let seen = null;
+    form.addEventListener("zurtr:error", (e) => { seen = e; });
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await tick(30);
+    const id = JSON.parse(live().last()).batch[0].id;
+    live().push({ t: "error", event: id, kind: "validation", fields: { title: "required" }, message: "title is required" });
+    assert(seen !== null, "zurtr:error dispatched");
+    assert(seen.target === form, "dispatched on the event's form");
+    eq(seen.detail.kind, "validation", "kind");
+    eq(seen.detail.fields, { title: "required" }, "fields map");
+    eq(seen.detail.message, "title is required", "message");
+    eq(seen.detail.event, id, "the rejected event id");
+    assert(document.activeElement === title, "the first invalid field was focused");
+    live().cut();
+    await tick(250);
+    eq(JSON.parse(live().sent[0]).pending, [], "a rejected event is never resent");
+  });
+
+  test("uploads: data-z-upload POSTs FormData with progress events", () => {
+    const RealXHR = window.XMLHttpRequest, made = [], seen = [];
+    window.XMLHttpRequest = function () { this.upload = {}; made.push(this); };
+    window.XMLHttpRequest.prototype.open = function (m, u) { this.method = m; this.url = u; };
+    window.XMLHttpRequest.prototype.send = function (b) { this.body = b; };
+    try {
+      mount('<input type="file" data-z="220" data-z-upload="avatar" name="avatar">');
+      const input = byId(220);
+      input.addEventListener("zurtr:upload", (e) => seen.push(e.detail));
+      const dt = new DataTransfer();
+      dt.items.add(new File(["hello"], "a.txt"));
+      input.files = dt.files;
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      eq(made.length, 1, "one upload request");
+      const xhr = made[0];
+      eq(xhr.method, "POST", "method");
+      eq(xhr.url, "/zurtr/upload?token=tok", "session-scoped endpoint with the token");
+      assert(xhr.body instanceof FormData, "FormData body");
+      eq(xhr.body.get("avatar").name, "a.txt", "file appended under the input name");
+      xhr.upload.onprogress({ lengthComputable: true, loaded: 2, total: 5 });
+      eq(seen[0], { name: "avatar", loaded: 2, total: 5, done: false, error: null }, "progress detail");
+      xhr.status = 201;
+      xhr.onload();
+      eq(seen[1], { name: "avatar", loaded: 2, total: 5, done: true, error: null }, "2xx completes the upload");
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      made[1].status = 500;
+      made[1].onload();
+      eq(seen[2], { name: "avatar", loaded: 5, total: 5, done: false, error: "HTTP 500" }, "non-2xx is an error");
+    } finally {
+      window.XMLHttpRequest = RealXHR;
+    }
+  });
+
+  test("malformed: bad frames are warned about and tolerated", async () => {
+    mount('<p data-z="200">x</p>');
+    const warn = console.warn;
+    let warnings = 0;
+    console.warn = function () { warnings++; };
+    const before = live().sent.length;
+    try {
+      ["{not json", "[]", "null", '"str"', '{"t":"nope"}', '{"t":"patch"}', '{"t":"patch","ops":"bad"}',
+       '{"t":"error"}', '{"t":"redirect"}', '{"t":"resync"}', '{"t":"ready","rev":"x"}', '{"t":"patch","rev":13,"ops":[{"op":"bogus"},{"op":"text","id":200,"value":"still alive"}],"acks":[999]}'
+      ].forEach((f) => live().push(f));
+    } finally {
+      console.warn = warn;
+    }
+    eq(byId(200).textContent, "still alive", "valid ops in a later frame still apply");
+    assert(warnings >= 8, "every unusable frame warned (" + warnings + " warnings)");
+    const ack = frames(live()).slice(before).filter((f) => f.t === "ack").pop();
+    eq(ack, { t: "ack", rev: 13 }, "still acks after malformed input");
+    assert(uncaught === 0, "no uncaught exceptions"); 
+  });
+
+  test("beacon: data-z-beacon emits a paint frame after each patch", async () => {
+    mount('<p data-z="200">x</p>');
+    document.documentElement.setAttribute("data-z-beacon", "");
+    const before = live().sent.length;
+    live().push({ t: "patch", rev: 14, ops: [{ op: "insert", parent: 200, index: 0, html: "<b data-z=202>x</b>" }] });
+    const out = frames(live()).slice(before);
+    eq(out.length, 2, "ack then beacon");
+    eq(out[0], { t: "ack", rev: 14 }, "ack first");
+    eq(out[1].t, "beacon", "beacon frame");
+    eq(out[1].phase, "paint", "phase");
+    assert(typeof out[1].at === "number" && out[1].at > 0, "performance.now() timestamp");
+    eq(live().last(), JSON.stringify({ t: "beacon", phase: "paint", at: out[1].at }), "exact beacon frame");
+    eq(byId(202).textContent, "x", "the patch landed");
+    document.documentElement.removeAttribute("data-z-beacon");
+  });
+
+  test("queue: pending events are capped at 256 with a warning", async () => {
+    const warn = console.warn;
+    let dropped = 0;
+    console.warn = function (...a) { if (String(a[1]).indexOf("pending queue over") === 0) dropped++; };
+    try {
+      for (let i = 0; i < 300; i++) ZL.sendEvent("bulk", { i: i });
+      ZL.flush();
+    } finally {
+      console.warn = warn;
+    }
+    assert(dropped >= 44, "the oldest events were dropped with a warning (" + dropped + ")");
+    live().cut();
+    await tick(250);
+    eq(JSON.parse(live().sent[0]).pending.length, 256, "hello presents at most 256 pending ids");
+    live().push({ t: "ready", rev: 0, resume: false });
+    eq(frames(live()).filter((f) => f.t === "events").length, 0, "unresumed events are not resent");
+  });
+
+  test("config: start() reads data-z-* attributes off the document", async () => {
+    ZL.disconnect();
+    const html = document.documentElement;
+    html.setAttribute("data-z-token", "html-token");
+    html.setAttribute("data-z-rev", "42");
+    html.setAttribute("data-z-ws", "ws://from-html/live");
+    try {
+      ZL.start();
+      await tick(5);
+      eq(live().url, "ws://from-html/live", "ws url from the document");
+      eq(live().sent[0], JSON.stringify({ t: "hello", token: "html-token", rev: 42, pending: [] }), "hello from page config");
+    } finally {
+      html.removeAttribute("data-z-token");
+      html.removeAttribute("data-z-rev");
+      html.removeAttribute("data-z-ws");
+    }
+  });
+
+  test("config: start() falls back to the [data-z-live-config] meta tag", async () => {
+    const meta = document.createElement("meta");
+    meta.setAttribute("data-z-live-config", JSON.stringify({ token: "meta-token", rev: 43, ws: "ws://from-meta/live" }));
+    document.head.appendChild(meta);
+    ZL.disconnect();
+    try {
+      ZL.start();
+      await tick(5);
+      eq(live().url, "ws://from-meta/live", "ws url from the meta tag");
+      eq(live().sent[0], JSON.stringify({ t: "hello", token: "meta-token", rev: 43, pending: [] }), "hello from the meta tag");
+    } finally {
+      meta.remove();
+    }
+  });
+
+  test("disconnect: closes the socket, clears timers, never reconnects", async () => {
+    const s = live();
+    eq(s.readyState, 1, "socket open before disconnect");
+    ZL.sendEvent("queued-after-disconnect", {});
+    ZL.disconnect();
+    eq(s.readyState, 3, "socket closed");
+    const count = sockets.length;
+    await tick(300);
+    eq(sockets.length, count, "no reconnect attempt after an explicit disconnect");
+    ZL.flush(); // must be a no-op, not a throw
+    eq(frames(s).filter((f) => f.t === "events" && f.batch[0].ev === "queued-after-disconnect").length, 0, "nothing sent after disconnect");
+  });
+
+  /* ---------- runner ---------- */
+  async function run() {
+    for (const c of cases) {
+      try {
+        await Promise.race([c.fn(), tick(3000).then(() => { throw new Error("timed out"); })]);
+        passed++;
+        line("pass", "PASS  " + c.name);
+      } catch (e) {
+        failed++;
+        line("fail", "FAIL  " + c.name + "\n      " + (e && e.message));
+      }
+    }
+    const total = passed + failed;
+    const summary = (failed === 0 && uncaught === 0 ? "PASS " : "FAIL ") + passed + "/" + total;
+    line("summary " + (failed === 0 && uncaught === 0 ? "pass" : "fail"), summary);
+    document.title = summary;
+  }
+
+  /* ---------- dead-socket mode: no stub, a ws url nothing listens on ---------- */
+  function bogusMode() {
+    line("info", "bogus mode: real WebSocket against a dead endpoint; expect [zurtr] warnings only");
+    const RealWS = window.WebSocket;
+    let attempts = 0, errors = 0;
+    window.WebSocket = function (url) { attempts++; return new RealWS(url); };
+    window.WebSocket.prototype = RealWS.prototype;
+    window.addEventListener("error", (e) => { errors++; line("fail", "UNCAUGHT " + e.message); });
+    const html = document.documentElement;
+    html.setAttribute("data-z-token", "bogus-token");
+    html.setAttribute("data-z-rev", "0");
+    html.setAttribute("data-z-ws", "ws://127.0.0.1:1/zurtr/live"); // nothing listens on port 1
+    ZL.start();
+    setTimeout(() => {
+      const ok = errors === 0 && attempts >= 2;
+      const summary = (ok ? "PASS " : "FAIL ") + (ok ? 1 : 0) + "/1";
+      line(ok ? "pass" : "fail", (ok ? "PASS " : "FAIL ") + "bogus socket: 0 uncaught exceptions, " + attempts + " connect attempts (backoff retried)");
+      line("summary " + (ok ? "pass" : "fail"), summary);
+      document.title = summary;
+    }, 1500);
+  }
+
+  if (location.search.indexOf("bogus") >= 0) {
+    bogusMode();
+  } else {
+    window.WebSocket = StubSocket;
+    ZL.start({ token: "tok", rev: 1, ws: "ws://stub/live" });
+    run();
+  }
+})();
+</script>
+</body>
+</html>

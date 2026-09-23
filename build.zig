@@ -1,54 +1,69 @@
+//! zurtr's build.
+//!
+//! One vendored transport: **zix** (`deps/zix`) — HTTP/1.1 and HTTP/3 on one origin, and
+//! WebTransport for the live channel. It replaces the previously vendored swerver, including its
+//! PostgreSQL protocol layer: zix carries its own drivers, `postgrez` among them, and those are what
+//! the `data` module builds on.
+//!
+//! zix needs three things from a consumer's build, and they are reproduced here exactly as zix's own
+//! `build.zig` wires them:
+//!
+//!   * the `zon_options` module (the user agent and version zix reports),
+//!   * Brotli's static dictionary (RFC 7932 Appendix A), generated into the cache by
+//!     `brotli_dictionary.gen.zig` and bound to the `@embedFile` import in `brotli.zig`, so no binary
+//!     asset is tracked,
+//!   * nothing else: the rest of zix is self-contained source.
+//!
+//! The base build is the transport plus the framework, with no external dependencies beyond libc.
+
 const std = @import("std");
+
+/// zix's manifest, read from the vendored tree so the options module carries zix's own values.
+const zix_zon = @import("deps/zix/build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // --- swerver (vendored) -------------------------------------------------
-    // See deps/swerver/UPSTREAM.md. Feature flags mirror upstream's build
-    // options; alles opt-in, base build is HTTP/1.1-only with no external
-    // dependencies.
-    const enable_tls = b.option(bool, "swerver-tls", "swerver: TLS 1.3 (requires OpenSSL)") orelse false;
-    const enable_http2 = b.option(bool, "swerver-http2", "swerver: HTTP/2") orelse false;
-    const enable_http3 = b.option(bool, "swerver-http3", "swerver: HTTP/3 over QUIC (implies TLS)") orelse false;
-    const enable_proxy = b.option(bool, "swerver-proxy", "swerver: reverse proxy") orelse false;
-    const enable_io_uring = b.option(bool, "swerver-io-uring", "swerver: io_uring backend (Linux)") orelse false;
-    const enable_compression = b.option(bool, "swerver-compression", "swerver: response compression (requires zlib)") orelse false;
-
-    const swerver_options = b.addOptions();
-    swerver_options.addOption(bool, "enable_tls", enable_tls);
-    swerver_options.addOption(bool, "enable_http2", enable_http2);
-    swerver_options.addOption(bool, "enable_http3", enable_http3 and enable_tls);
-    swerver_options.addOption(bool, "enable_proxy", enable_proxy);
-    swerver_options.addOption(bool, "enable_io_uring", enable_io_uring);
-    swerver_options.addOption(bool, "enable_x402_crypto", false);
-    swerver_options.addOption(bool, "enable_compression", enable_compression);
-    swerver_options.addOption(bool, "enable_wasm", false);
-
-    const swerver_mod = b.addModule("swerver", .{
-        .root_source_file = b.path("deps/swerver/src/lib.zig"),
+    // --- zix (vendored) -----------------------------------------------------
+    const zix = b.addModule("zix", .{
+        .root_source_file = b.path("deps/zix/src/lib.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
     });
-    swerver_mod.addOptions("build_options", swerver_options);
-    if (enable_compression) swerver_mod.linkSystemLibrary("z", .{});
-    if (enable_tls or enable_http3) {
-        swerver_mod.linkSystemLibrary("ssl", .{});
-        swerver_mod.linkSystemLibrary("crypto", .{});
-    }
+
+    const zon_options = b.addOptions();
+    zon_options.addOption([]const u8, "user_agent", zix_zon.user_agent);
+    zon_options.addOption([]const u8, "version", zix_zon.version);
+    zix.addOptions("zon_options", zon_options);
+
+    // Compiling the codec depends on this run through the anonymous import, so any target that builds
+    // zix regenerates the dictionary first.
+    const brotli_dict_gen = b.addExecutable(.{
+        .name = "zix_brotli_dictionary_gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("deps/zix/src/utils/compression/brotli_dictionary.gen.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const brotli_dict_run = b.addRunArtifact(brotli_dict_gen);
+    const brotli_dict = brotli_dict_run.addOutputFileArg("brotli_dictionary.bin");
+    zix.addAnonymousImport("brotli_dictionary.bin", .{ .root_source_file = brotli_dict });
 
     // --- zurtr --------------------------------------------------------------
-    const zurtr_mod = b.addModule("zurtr", .{
+    const zurtr = b.addModule("zurtr", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "swerver", .module = swerver_mod },
+            .{ .name = "zix", .module = zix },
         },
     });
 
     // --- executable ---------------------------------------------------------
+    // Applications deploy as one static executable, and this is the framework's own entry point
+    // (assembly and roles hang off it).
     const exe = b.addExecutable(.{
         .name = "zurtr",
         .root_module = b.createModule(.{
@@ -56,8 +71,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zurtr", .module = zurtr_mod },
-                .{ .name = "swerver", .module = swerver_mod },
+                .{ .name = "zurtr", .module = zurtr },
             },
         }),
     });
@@ -70,19 +84,21 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // --- tests --------------------------------------------------------------
-    const zurtr_tests = b.addTest(.{ .root_module = zurtr_mod });
+    const zurtr_tests = b.addTest(.{ .root_module = zurtr });
     const run_zurtr_tests = b.addRunArtifact(zurtr_tests);
 
-    const swerver_tests = b.addTest(.{ .root_module = swerver_mod });
-    const run_swerver_tests = b.addRunArtifact(swerver_tests);
+    // zix's `lib.zig` reaches every module in the tree through `refAllDecls`, so testing it tests the
+    // vendored transport rather than only its root.
+    const zix_tests = b.addTest(.{ .root_module = zix });
+    const run_zix_tests = b.addRunArtifact(zix_tests);
 
     const test_zurtr_step = b.step("test-zurtr", "Run zurtr tests");
     test_zurtr_step.dependOn(&run_zurtr_tests.step);
 
-    const test_swerver_step = b.step("test-swerver", "Run vendored swerver tests");
-    test_swerver_step.dependOn(&run_swerver_tests.step);
+    const test_zix_step = b.step("test-zix", "Run the vendored zix tests");
+    test_zix_step.dependOn(&run_zix_tests.step);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zurtr_tests.step);
-    test_step.dependOn(&run_swerver_tests.step);
+    test_step.dependOn(&run_zix_tests.step);
 }
