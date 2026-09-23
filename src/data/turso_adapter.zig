@@ -44,8 +44,8 @@ pub const default_lease = "default";
 /// The handle this returns is the whole contract: a v-table plus the opaque engine, closed with
 /// `Database.close`. Tier-specific surface (the write lease, and later the sync handle) is reached
 /// through `engine(&handle)`.
-pub fn open(allocator: std.mem.Allocator, tier: data.Tier) data.Error!data.Database {
-    return Engine.open(allocator, tier);
+pub fn open(allocator: std.mem.Allocator, io: std.Io, tier: data.Tier) data.Error!data.Database {
+    return Engine.open(allocator, io, tier);
 }
 
 /// The engine behind a handle, for the tier-specific surface (the write lease).
@@ -55,6 +55,9 @@ pub fn engine(handle: *data.Database) *Engine {
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
+    /// The clock the lease compares against, and (for the tiers that have one) the transport the sync
+    /// half would use.
+    io: std.Io,
     database: turso.Database,
     connection: turso.Connection,
     tier: data.Tier,
@@ -70,7 +73,7 @@ pub const Engine = struct {
     /// Row scratch, reused per row.
     columns: std.ArrayList(data.Value) = .empty,
 
-    pub fn open(allocator: std.mem.Allocator, tier: data.Tier) data.Error!data.Database {
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, tier: data.Tier) data.Error!data.Database {
         const path = switch (tier) {
             .memory => ":memory:",
             .file => |p| p,
@@ -78,14 +81,17 @@ pub const Engine = struct {
             .distributed => |d| d.path,
         };
 
-        // The remote half of these tiers is a different build of the native SDK. Say so instead of
-        // silently serving the local file: a caller that asked for synchronization must not get a
-        // database that quietly never synchronizes.
+        // The remote half of these tiers is a different build of the native SDK *and* a transport that
+        // drives it. The transport is not wired yet, so `.sync` is refused outright rather than opening
+        // a local file and quietly never synchronizing — a caller that asked for synchronization must
+        // not get a database that pretends to.
+        //
+        // `.distributed` opens: its local half is real and enforced (the write lease below), and what
+        // it still needs for a deployment across machines is the same transport `.sync` is waiting on.
+        // `-Dturso-sync` builds the SDK; nothing calls it yet.
         switch (tier) {
-            .sync, .distributed => {
-                if (!@import("build_options").turso_sync) return error.Unavailable;
-            },
-            .memory, .file => {},
+            .sync => return error.Unavailable,
+            .memory, .file, .distributed => {},
         }
 
         const instance = allocator.create(Engine) catch return error.Internal;
@@ -93,6 +99,7 @@ pub const Engine = struct {
 
         instance.* = .{
             .allocator = allocator,
+            .io = io,
             .database = turso.Database.open(allocator, .{ .path = path }) catch |err| return mapError(err),
             .connection = undefined,
             .tier = tier,
@@ -164,6 +171,14 @@ pub const Engine = struct {
         const self: *Engine = @ptrCast(@alignCast(context));
         if (self.tx != null) return error.Operation;
 
+        // The distributed tier's rule, enforced where writes actually begin rather than trusted to the
+        // caller: a node writes only while it holds the lease, and a follower that asks to write while
+        // someone else holds it is told so. Reads never need the lease — one writer, many readers.
+        if (mode == .read_write and self.tier == .distributed) {
+            const node = self.tier.distributed.node;
+            if (!try self.claimLease(self.tier.distributed.lease_name, node, self.nowMicros())) return error.Conflict;
+        }
+
         self.tx = self.connection.begin(.immediate, .{}) catch |err| return mapError(err);
 
         const tx = self.allocator.create(data.Tx) catch return error.Internal;
@@ -209,6 +224,14 @@ pub const Engine = struct {
         self.connection.deinit();
         self.database.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// The wall clock, in microseconds. Only ordering matters here: a lease compares it against the
+    /// expiry it wrote, and every node that shares a database shares the same clock's direction.
+    fn nowMicros(self: *Engine) i64 {
+        const stamp = std.Io.Clock.Timestamp.now(self.io, .real);
+
+        return @intCast(@divTrunc(stamp.raw.toNanoseconds(), std.time.ns_per_us));
     }
 
     // --------------------------------------------------------- //

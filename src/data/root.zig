@@ -104,6 +104,11 @@ pub const Tier = union(enum) {
         /// What this node intends to be. A `follower` never takes the lease while another node holds it;
         /// a `leader` takes it when it is free.
         role: Role = .follower,
+        /// What this node calls itself when it claims the lease.
+        node: []const u8,
+        /// Which lease to hold. One logical database has one writer, so this is only interesting when a
+        /// deployment splits one database into several independently-written regions.
+        lease_name: []const u8 = "default",
     };
 
     pub const Role = enum { leader, follower };
@@ -221,6 +226,6 @@ test "a tier says what it is" {
     try std.testing.expectEqualStrings("sync", (Tier{ .sync = .{ .path = "app.db", .remote = "https://example" } }).describe());
     try std.testing.expectEqualStrings(
         "distributed",
-        (Tier{ .distributed = .{ .path = "app.db", .remote = "https://example" } }).describe(),
+        (Tier{ .distributed = .{ .path = "app.db", .remote = "https://example", .node = "node-a" } }).describe(),
     );
 }

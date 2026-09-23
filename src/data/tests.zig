@@ -52,7 +52,7 @@ fn schema(db: *data.Database) !void {
 }
 
 fn freshMemory(arena: std.mem.Allocator) !data.Database {
-    var db = try adapter.open(arena, .memory);
+    var db = try adapter.open(arena, std.testing.io, .memory);
     try schema(&db);
 
     return db;
@@ -176,7 +176,7 @@ test "the file tier survives closing and reopening" {
     defer for (siblings) |file| std.Io.Dir.cwd().deleteFile(std.testing.io, file) catch {};
 
     {
-        var db = try adapter.open(arena, .{ .file = path });
+        var db = try adapter.open(arena, std.testing.io, .{ .file = path });
         defer db.close();
 
         try schema(&db);
@@ -186,7 +186,7 @@ test "the file tier survives closing and reopening" {
     }
 
     // The whole point of the tier: the process that wrote this is gone.
-    var db = try adapter.open(arena, .{ .file = path });
+    var db = try adapter.open(arena, std.testing.io, .{ .file = path });
     defer db.close();
 
     var collector = Collector.init(arena);
@@ -230,18 +230,67 @@ test "only one node holds the write lease, and it expires" {
     try std.testing.expect((try engine.leaseHolder(adapter.default_lease)) == null);
 }
 
-test "a tier that needs the sync SDK says so instead of pretending" {
+test "a tier whose remote transport is not wired refuses instead of pretending" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // This build has no sync SDK Kit, so the tier is refused rather than quietly served as local: a
-    // caller that asked for synchronization must not get a database that never synchronizes.
-    const refused = adapter.open(arena, .{ .sync = .{ .path = ":memory:", .remote = "https://example.invalid" } });
-    if (@import("build_options").turso_sync) {
-        var db = try refused;
-        db.close();
-    } else {
-        try std.testing.expectError(error.Unavailable, refused);
-    }
+    // The sync tier's remote half needs a transport that does not exist yet, so the tier is refused
+    // whether or not the SDK Kit is built: opening the local file instead would hand a caller that
+    // asked for synchronization a database that never synchronizes, which is worse than an error.
+    try std.testing.expectError(error.Unavailable, adapter.open(arena, std.testing.io, .{
+        .sync = .{ .path = ":memory:", .remote = "https://example.invalid" },
+    }));
+}
+
+test "a distributed tier writes only while it holds the lease" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path = "zig-cache-data-distributed-test.db";
+    const siblings = [_][]const u8{ path, path ++ "-wal", path ++ "-shm" };
+    for (siblings) |file| std.Io.Dir.cwd().deleteFile(std.testing.io, file) catch {};
+    defer for (siblings) |file| std.Io.Dir.cwd().deleteFile(std.testing.io, file) catch {};
+
+    // Two nodes, one logical database: separate engines over the same file, which is what a follower
+    // holds on a machine of its own.
+    const base = data.Tier{ .distributed = .{ .path = path, .remote = "https://example.invalid", .node = "node-a" } };
+    var leader = try adapter.open(arena, std.testing.io, base);
+    defer leader.close();
+    try schema(&leader);
+
+    const follower_tier = data.Tier{ .distributed = .{ .path = path, .remote = "https://example.invalid", .node = "node-b", .role = .follower } };
+    var follower = try adapter.open(arena, std.testing.io, follower_tier);
+    defer follower.close();
+
+    // Reading never needs the lease: one writer, many readers.
+    var collector = Collector.init(arena);
+    try follower.query(null, "SELECT count(*) AS n FROM notes", &.{}, collector.sink());
+    try std.testing.expectEqual(@as(usize, 1), collector.rows.items.len);
+
+    // The leader writes, and writing takes the lease.
+    var leader_tx = try leader.begin(.read_write);
+    _ = try leader.exec(leader_tx, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = 1 }, .{ .text = "from the leader" }, .{ .integer = 3 },
+    });
+    try leader_tx.commit();
+
+    // The follower asks to write while the lease is held: it is told no, rather than corrupting the
+    // timeline with a second writer.
+    try std.testing.expectError(error.Conflict, follower.begin(.read_write));
+
+    // With the lease released, the follower writes.
+    try std.testing.expect(try adapter.engine(&leader).releaseLease("default", "node-a"));
+
+    var follower_tx = try follower.begin(.read_write);
+    _ = try follower.exec(follower_tx, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = 2 }, .{ .text = "from the follower" }, .{ .integer = 3 },
+    });
+    try follower_tx.commit();
+
+    var both = Collector.init(arena);
+    try leader.query(null, "SELECT title FROM notes ORDER BY id", &.{}, both.sink());
+    try std.testing.expectEqual(@as(usize, 2), both.rows.items.len);
+    try std.testing.expectEqualStrings("from the follower", both.rows.items[1][0].text);
 }

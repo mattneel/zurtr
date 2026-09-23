@@ -109,10 +109,14 @@ The tier is the whole of an adapter's durability and reach, and it is chosen at 
 | `.sync` | a local file plus a remote database | the machine | every node syncing that remote |
 | `.distributed` | a local file per node, one logical database | the machine | many nodes, one writer |
 
-Tiers 1 and 2 are complete and tested. Tiers 3 and 4 need the sync SDK Kit, which is a separate build
-of the native library (`-Dsync=true` in the binding, surfaced as `-Dturso-sync` here); a build without
-it **refuses** `.sync` and `.distributed` with `error.Unavailable` rather than quietly serving the local
-file, because a caller that asked for synchronization must not get a database that never synchronizes.
+Tiers 1 and 2 are complete and tested. `.sync` is **refused** with `error.Unavailable`: the remote half
+needs a transport that is not wired yet, and opening the local file instead would leave a caller that
+asked for synchronization with a database that never synchronizes. `-Dturso-sync` builds the sync SDK
+Kit; nothing calls it yet, which is exactly why the tier still refuses.
+
+`.distributed` opens, because its enforceable half is local and real: reads from any node, writes only
+from the lease holder. What it still needs for a deployment across machines is the same transport
+`.sync` is waiting on — until then it is one machine's discipline, tested with two nodes over one file.
 
 ### The write lease
 
