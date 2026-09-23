@@ -1,0 +1,33 @@
+# The sync server, deployed without a public service on purpose.
+#
+# tursodb's sync server has no authentication at all (see cli/sync_server.rs: nothing reads
+# Authorization or any token header). An unauthenticated database endpoint must not be on the open
+# internet, and it does not need to be: the binding accepts a plain `http://` URL only when the host is
+# loopback, so the intended path is a tunnel, which lands on loopback and is therefore allowed.
+#
+#   fly apps create zurtr-sync
+#   fly volumes create tursodb_data --size 1 --region iad -a zurtr-sync
+#   fly deploy --ha=false                       # builds Dockerfile, pushes the machine
+#   fly proxy 18080:8080 -a zurtr-sync          # then: http://127.0.0.1:18080
+#
+# The proxy runs over Fly's private network, so the database is reachable only by someone who can run
+# `fly` against this organization — while the data still crosses a real machine boundary, which is what
+# makes it a distribution test rather than a local one.
+
+# There is no [http_service] and there will not be one: a public surface needs authentication this
+# server does not have. Reach it with `fly proxy` instead.
+app = "zurtr-sync"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# One machine, because the database is a file on a volume: a second machine would be a second database,
+# and the point of the sync server is that there is one place to synchronize against.
+[mounts]
+  source = "tursodb_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

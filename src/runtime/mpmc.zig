@@ -54,6 +54,9 @@ pub fn Queue(comptime T: type) type {
         /// hammer different counters, and putting them on one line would serialize them for no reason.
         enqueue_pos: std.atomic.Value(usize) align(cache_line) = .init(0),
         dequeue_pos: std.atomic.Value(usize) align(cache_line) = .init(0),
+        /// Items in the queue. Only for diagnostics and bounds — the algorithm below never reads it — so
+        /// it is a plain atomic that callers may see a moment out of date under concurrency.
+        count: std.atomic.Value(usize) = .init(0),
 
         pub const Error = error{
             /// Capacity must be at least 2 and a power of two.
@@ -88,6 +91,12 @@ pub fn Queue(comptime T: type) type {
             return self.buffer.len;
         }
 
+        /// Items currently in the queue. A snapshot: under concurrency it can be a moment stale, and it
+        /// is deliberately not what `push`/`pop` decide with.
+        pub fn len(self: *const Self) usize {
+            return self.count.load(.monotonic);
+        }
+
         /// Hand `value` to the queue. Returns false if it is full — not an error, and not a wait.
         pub fn push(self: *Self, value: T) bool {
             var pos = self.enqueue_pos.load(.monotonic);
@@ -120,6 +129,7 @@ pub fn Queue(comptime T: type) type {
             cell.value = value;
             // Release: the value write above must be visible to whoever acquires this slot.
             cell.sequence.store(pos + 1, .release);
+            _ = self.count.fetchAdd(1, .monotonic);
 
             return true;
         }
@@ -153,6 +163,7 @@ pub fn Queue(comptime T: type) type {
             const value = cell.value;
             // The slot becomes free for the producer a full lap ahead: position plus capacity.
             cell.sequence.store(pos +% self.mask +% 1, .release);
+            _ = self.count.fetchSub(1, .monotonic);
 
             return value;
         }

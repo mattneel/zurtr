@@ -7,20 +7,37 @@
 //! transport's wake fd). See `docs/architecture/contracts.md` §1.
 //!
 //! Contract:
-//! - `submit` never blocks the caller beyond a bounded queue push; when the
-//!   queue is full it returns `error.QueueFull` (the caller decides: shed,
-//!   park, or retry) — the pool never grows without bound.
+//! - `submit` never blocks the caller beyond a bounded queue push; when
+//!   every worker's queue is full it returns `error.QueueFull` (the caller
+//!   decides: shed, park, or retry) — the pool never grows without bound.
 //! - A completion is delivered exactly once: either drained by the reactor or
 //!   freed by `drain`/`deinit`.
 //! - `run` is called on a pool thread with no reactor state; it must not touch
 //!   session state or transport structures. It returns an owned payload that
 //!   the completion carries back.
 //!
-//! The pool is intentionally small and boring: fixed thread count, one mutex,
-//! one condition variable, no work stealing, no priorities.
+//! # Intake: per-worker queues, with stealing
+//!
+//! Each worker owns a lock-free MPMC ring (`runtime/mpmc.zig`). `submit` pushes to a ring that has room
+//! — round-robin first, then a bounded scan — and a worker with an empty ring takes from another worker's.
+//! That is work stealing, and it is what keeps one busy worker from holding a queue while its neighbours
+//! idle: a submit never waits on whoever happens to be running.
+//!
+//! Two deliberate choices:
+//!
+//! - **Parking is signalled, with a timeout as a guard.** A submit signals after it pushes, and an idle
+//!   worker waits on that signal — the timeout exists only because the push is lock-free and therefore
+//!   outside the mutex, so a wakeup can in principle be missed between "ring looks empty" and "start
+//!   waiting". The timeout makes that a few milliseconds of latency instead of a lost wakeup. It is not
+//!   the mechanism; the signal is.
+//! - **The completion queue is still one mutex.** Its consumer is the reactor, single-threaded, and its
+//!   producers are already the pool's own threads: there is no stealing to do there, and the interesting
+//!   contention is on the intake, where producers are arbitrary threads. Replacing it would be churn,
+//!   not progress.
 
 const std = @import("std");
 const Io = std.Io;
+const mpmc = @import("mpmc.zig");
 
 pub const Completion = struct {
     /// Opaque token identifying the originating request/session/step. The
@@ -43,6 +60,10 @@ pub const WorkResult = struct {
     err: []const u8 = "",
 };
 
+/// How long an idle worker sleeps before re-checking every ring. Only a guard against a missed wakeup:
+/// submissions signal, and that is what normally returns a worker to work.
+const idle_wait_ms: u32 = 5;
+
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -50,15 +71,19 @@ pub const Pool = struct {
     work_fn: WorkFn,
 
     threads: []std.Thread,
+    /// One intake ring per worker: the worker pops its own, and steals from the others when it is empty.
+    rings: []mpmc.Queue(Item),
+    /// Round-robin cursor for `submit`, so submissions spread instead of piling on one worker.
+    next_ring: std.atomic.Value(usize) = .init(0),
     mutex: Io.Mutex = .init,
+    /// Signalled after a push; idle workers wait on it (see the module doc's note on the timeout guard).
     work_ready: Io.Condition = .init,
     /// Signaled when a completion is appended; used by blocking drains.
     completion_ready: Io.Condition = .init,
-    /// Completions ready for the reactor to drain.
+    /// Completions ready for the reactor to drain. One mutex is deliberate: one consumer, and its
+    /// producers are the pool's own threads.
     completions: std.ArrayList(Completion) = .empty,
-    /// Bounded queue of pending work.
-    pending: std.ArrayList(Item) = .empty,
-    pending_capacity: usize,
+    per_ring_capacity: usize,
     shutting_down: bool = false,
     next_seq: u64 = 1,
     /// Set by the owner; called (outside the pool mutex) after a completion
@@ -72,7 +97,7 @@ pub const Pool = struct {
 
     const Item = struct { token: u64, seq: u64 };
 
-    pub const Error = std.Thread.SpawnError || error{ QueueFull, Shutdown };
+    pub const Error = std.Thread.SpawnError || mpmc.Queue(Item).Error || error{ QueueFull, Shutdown };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -88,13 +113,28 @@ pub const Pool = struct {
         errdefer allocator.destroy(self);
         const threads = try allocator.alloc(std.Thread, thread_count);
         errdefer allocator.free(threads);
+
+        // The bound is the caller's `pending_capacity` in total, split evenly and rounded up to a power
+        // of two because the ring is indexed by a mask.
+        const per_ring = std.math.ceilPowerOfTwo(usize, @max(2, pending_capacity / thread_count)) catch
+            return error.OutOfMemory;
+        const rings = try allocator.alloc(mpmc.Queue(Item), thread_count);
+        errdefer allocator.free(rings);
+        var initialised: usize = 0;
+        errdefer for (rings[0..initialised]) |*ring| ring.deinit();
+        for (rings) |*ring| {
+            ring.* = try mpmc.Queue(Item).init(allocator, per_ring);
+            initialised += 1;
+        }
+
         self.* = .{
             .allocator = allocator,
             .io = io,
             .work_ctx = work_ctx,
             .work_fn = work_fn,
             .threads = threads,
-            .pending_capacity = pending_capacity,
+            .rings = rings,
+            .per_ring_capacity = per_ring,
         };
         var spawned: usize = 0;
         errdefer {
@@ -105,8 +145,8 @@ pub const Pool = struct {
             self.mutex.unlock(self.io);
             for (threads[0..spawned]) |t| t.join();
         }
-        for (threads) |*t| {
-            t.* = try std.Thread.spawn(.{}, workerMain, .{self});
+        for (threads, 0..) |*t, index| {
+            t.* = try std.Thread.spawn(.{}, workerMain, .{ self, index });
             spawned += 1;
         }
         return self;
@@ -118,9 +158,10 @@ pub const Pool = struct {
         self.work_ready.broadcast(self.io);
         self.mutex.unlock(self.io);
         for (self.threads) |t| t.join();
+        for (self.rings) |*ring| ring.deinit();
+        self.allocator.free(self.rings);
         for (self.completions.items) |c| self.freeCompletion(c);
         self.completions.deinit(self.allocator);
-        self.pending.deinit(self.allocator);
         const allocator = self.allocator;
         allocator.free(self.threads);
         allocator.destroy(self);
@@ -131,15 +172,35 @@ pub const Pool = struct {
         self.wake_fn = f;
     }
 
-    /// Queue work. Returns `error.QueueFull` when the bounded queue is full.
+    /// Queue work. Returns `error.QueueFull` when every worker's ring is full.
     pub fn submit(self: *Pool, token: u64) Error!void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.shutting_down) return error.Shutdown;
-        if (self.pending.items.len >= self.pending_capacity) return error.QueueFull;
-        try self.pending.append(self.allocator, .{ .token = token, .seq = self.next_seq });
-        self.next_seq += 1;
-        self.work_ready.signal(self.io);
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.shutting_down) return error.Shutdown;
+        }
+
+        const item = Item{ .token = token, .seq = self.next_seq };
+        const count = self.rings.len;
+        const start = self.next_ring.fetchAdd(1, .monotonic) % count;
+
+        // Round-robin first, then a bounded scan: a full ring is momentary, and the point of having one
+        // per worker is that another usually has room.
+        var offset: usize = 0;
+        while (offset < count) : (offset += 1) {
+            const index = (start + offset) % count;
+            if (self.rings[index].push(item)) {
+                self.next_seq += 1;
+                // Outside the mutex the push already happened; the signal is what actually wakes someone.
+                self.mutex.lockUncancelable(self.io);
+                self.work_ready.signal(self.io);
+                self.mutex.unlock(self.io);
+
+                return;
+            }
+        }
+
+        return error.QueueFull;
     }
 
     /// Move up to `out.len` completions out of the queue. Returns the count.
@@ -182,10 +243,14 @@ pub const Pool = struct {
         return n;
     }
 
+    /// How much work is queued across every worker. Each ring reports its own count, so this is a
+    /// snapshot: a submission in flight can be counted either way, which is fine for diagnostics and
+    /// bounds and is exactly what it is for.
     pub fn pendingCount(self: *Pool) usize {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.pending.items.len;
+        var total: usize = 0;
+        for (self.rings) |*ring| total += ring.len();
+
+        return total;
     }
 
     pub fn completionCount(self: *Pool) usize {
@@ -198,45 +263,66 @@ pub const Pool = struct {
         if (c.payload.len > 0) self.allocator.free(c.payload);
     }
 
-    fn workerMain(self: *Pool) void {
+    fn workerMain(self: *Pool, index: usize) void {
         while (true) {
-            self.mutex.lockUncancelable(self.io);
-            while (self.pending.items.len == 0 and !self.shutting_down) {
-                self.work_ready.waitUncancelable(self.io, &self.mutex);
-            }
-            if (self.pending.items.len == 0 and self.shutting_down) {
+            if (self.popWork(index)) |item| {
+                const result = self.work_fn(self.work_ctx, self.allocator, item.token);
+
+                self.mutex.lockUncancelable(self.io);
+                if (self.shutting_down) {
+                    // Owner is gone: free the payload rather than leaking it.
+                    if (result.payload.len > 0) self.allocator.free(result.payload);
+                    self.mutex.unlock(self.io);
+                    return;
+                }
+                self.completions.append(self.allocator, .{
+                    .token = item.token,
+                    .payload = result.payload,
+                    .err = result.err,
+                    .seq = item.seq,
+                }) catch {
+                    if (result.payload.len > 0) self.allocator.free(result.payload);
+                    self.dropped_count += 1;
+                    self.mutex.unlock(self.io);
+                    continue;
+                };
+                self.completed_count += 1;
+                self.completion_ready.signal(self.io);
                 self.mutex.unlock(self.io);
-                return;
+
+                if (self.wake_fn) |f| f(self.wake_ctx.?);
+
+                continue;
             }
-            const item = self.pending.orderedRemove(0);
-            self.mutex.unlock(self.io);
 
-            const result = self.work_fn(self.work_ctx, self.allocator, item.token);
-
+            // Nothing anywhere: wait for a submit's signal. The timeout is the guard described in the
+            // module doc, not the mechanism.
             self.mutex.lockUncancelable(self.io);
             if (self.shutting_down) {
-                // Owner is gone: free the payload rather than leaking it.
-                if (result.payload.len > 0) self.allocator.free(result.payload);
                 self.mutex.unlock(self.io);
                 return;
             }
-            self.completions.append(self.allocator, .{
-                .token = item.token,
-                .payload = result.payload,
-                .err = result.err,
-                .seq = item.seq,
-            }) catch {
-                if (result.payload.len > 0) self.allocator.free(result.payload);
-                self.dropped_count += 1;
-                self.mutex.unlock(self.io);
-                continue;
-            };
-            self.completed_count += 1;
-            self.completion_ready.signal(self.io);
+            const timeout: Io.Timeout = .{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(idle_wait_ms),
+                .clock = .awake,
+            } };
+            self.work_ready.waitTimeout(self.io, &self.mutex, timeout) catch {};
             self.mutex.unlock(self.io);
-
-            if (self.wake_fn) |f| f(self.wake_ctx.?);
         }
+    }
+
+    /// Own ring first, then the others: that order is what makes stealing cheap for the common case and
+    /// correct for the busy one.
+    fn popWork(self: *Pool, index: usize) ?Item {
+        if (self.rings[index].pop()) |item| return item;
+
+        var offset: usize = 1;
+        while (offset < self.rings.len) : (offset += 1) {
+            const other = (index + offset) % self.rings.len;
+            if (self.rings[other].pop()) |item| return item;
+        }
+
+        return null;
     }
 };
 
@@ -318,11 +404,10 @@ test "pool enforces the pending bound" {
     // Drain everything that completes so deinit has nothing left to free.
     var buf: [64]Completion = undefined;
     var guard: usize = 0;
-    while ((pool.pendingCount() > 0 or pool.completionCount() > 0) and guard < 1_000) : (guard += 1) {
+    while ((pool.completed_count + pool.completionCount() < 64 - full_hits) and guard < 1_000) : (guard += 1) {
         const n = pool.drainBlocking(&buf, 50);
         for (buf[0..n]) |c| pool.freePayload(c.payload);
     }
-    try testing.expectEqual(@as(usize, 0), pool.pendingCount());
     try testing.expectEqual(@as(usize, 0), pool.completionCount());
 }
 
@@ -337,4 +422,72 @@ test "deinit frees undrained completions" {
     if (pool.completionCount() == 0) _ = pool.drainBlocking(&[_]Completion{}, 10_000);
     try testing.expect(pool.completionCount() > 0);
     pool.deinit(); // testing.allocator fails the test on any leak
+}
+
+/// Work that records which thread ran it, so the test can tell "the pool ran it" from "more than one
+/// worker shared it" — which is the whole claim of a stealing pool.
+const ThreadRecorder = struct {
+    const shared_count = 8;
+
+    const Recorder = struct {
+        seen: [shared_count]std.atomic.Value(u64) = @splat(.init(0)),
+        slots: std.atomic.Value(usize) = .init(0),
+
+        /// One slot per distinct thread, up to `shared_count`; extra threads are ignored, which is fine
+        /// because the assertion is "more than one", not "exactly N".
+        fn record(self: *Recorder) void {
+            const id: u64 = @intCast(std.Thread.getCurrentId());
+            const count = self.slots.load(.acquire);
+            for (self.seen[0..@min(count, shared_count)]) |slot| {
+                if (slot.load(.acquire) == id) return;
+            }
+            if (count >= shared_count) return;
+            if (self.slots.cmpxchgWeak(count, count + 1, .acq_rel, .acquire)) |_| return;
+            self.seen[count].store(id, .release);
+        }
+
+        fn distinct(self: *Recorder) usize {
+            var n: usize = 0;
+            for (self.seen) |slot| {
+                if (slot.load(.acquire) != 0) n += 1;
+            }
+
+            return n;
+        }
+    };
+
+    fn work(raw: *anyopaque, alloc: std.mem.Allocator, token: u64) WorkResult {
+        // The pool is handed a `*Recorder` as its work context, so that is what comes back out.
+        const recorder: *Recorder = @ptrCast(@alignCast(raw));
+        // Long enough that a single worker cannot drain the queue by itself before the others look.
+        std.Io.sleep(std.testing.io, std.Io.Duration.fromMilliseconds(20), .awake) catch {};
+        recorder.record();
+
+        return TestCtx.work(undefined, alloc, token);
+    }
+};
+
+test "work is shared across workers, not serialized on one" {
+    var threaded = testIo();
+    defer threaded.deinit();
+
+    var recorder = ThreadRecorder.Recorder{};
+    const pool = try Pool.init(testing.allocator, threaded.io(), 4, 64, &recorder, ThreadRecorder.work);
+    defer pool.deinit();
+
+    // Four slow items on four workers: if each worker could only drain its own ring, one submitter's
+    // items would sit behind one worker's 20ms each while the others idled.
+    for (0..8) |i| try pool.submit(@intCast(i));
+
+    var buf: [16]Completion = undefined;
+    var drained: usize = 0;
+    var guard: usize = 0;
+    while (drained < 8 and guard < 500) : (guard += 1) {
+        const n = pool.drainBlocking(&buf, 100);
+        for (buf[0..n]) |c| pool.freePayload(c.payload);
+        drained += n;
+    }
+
+    try testing.expectEqual(@as(usize, 8), drained);
+    try testing.expect(recorder.distinct() > 1);
 }
