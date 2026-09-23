@@ -100,6 +100,32 @@ pub const hooks = [_]Hook{
     },
 };
 
+/// The value a generated project's `build.zig.zon` needs for `.fingerprint`, as 16 lowercase hex
+/// digits without a `0x` prefix — the form the templates interpolate.
+///
+/// This cannot be hardcoded: Zig validates the field as a packed `struct(u64) { id: u32, checksum:
+/// u32 }` with `checksum == Crc32(name)` and an id that is neither 0 nor 0xffffffff, and a zon
+/// accepts only an integer literal — no expressions. A wrong or absent fingerprint fails the
+/// generated project at `zig build` with "invalid fingerprint: 0x…", which would make the whole
+/// generator useless for every name but the one it was written for.
+///
+/// The id is 1 rather than random. The toolchain generates a random one, and its comment gives the
+/// reason uniqueness matters: only among packages in a single dependency graph. Two projects from
+/// this command have different names in theirs, so a fixed id is correct here — and a generator
+/// whose output changes between runs for the same input is harder to check than one whose output
+/// does not.
+///
+/// Verified against the toolchain rather than argued: in a zon with a dependency graph, `id = 1`
+/// builds and `id = 0xffffffff` is rejected with "invalid fingerprint: …; use this value: 0x…",
+/// and that suggested value's high half is exactly what `std.hash.Crc32` returns for the name — so
+/// this agrees with the compiler's own generator on the half that carries meaning.
+pub fn fingerprint(name: []const u8, out: *[16]u8) []const u8 {
+    const id: u32 = 1;
+    const value: u64 = (@as(u64, std.hash.Crc32.hash(name)) << 32) | id;
+
+    return std.fmt.bufPrint(out, "{x:0>16}", .{value}) catch unreachable;
+}
+
 /// The entries this run writes.
 pub fn planned(comptime plan: []const Entry, options: Options, out: []Entry) []Entry {
     var count: usize = 0;
@@ -174,6 +200,35 @@ test "a condition selects exactly the entries whose flag is set" {
     }, &buffer);
     try testing.expectEqual(fixtures.len - 1, no_zscript.len);
     for (no_zscript) |entry| try testing.expect(!std.mem.eql(u8, entry.dest, "zscript"));
+}
+
+test "the fingerprint satisfies the rule the toolchain validates" {
+    // The rule, restated from the compiler rather than trusted: the high half is the CRC and the
+    // low half is an id outside {0, 0xffffffff}. If a rendered zon is ever rejected, this is the
+    // test that should have caught it.
+    for ([_][]const u8{ "hello", "", "a-longer-project-name", "Zig", "x" }) |name| {
+        var buffer: [16]u8 = undefined;
+        const hex = fingerprint(name, &buffer);
+
+        try testing.expectEqual(@as(usize, 16), hex.len);
+        const value = try std.fmt.parseInt(u64, hex, 16);
+
+        const id: u32 = @truncate(value);
+        const checksum: u32 = @truncate(value >> 32);
+        try testing.expect(id != 0);
+        try testing.expect(id != 0xffffffff);
+        try testing.expectEqual(std.hash.Crc32.hash(name), checksum);
+    }
+
+    // Same input, same output: a generator that cannot be checked twice is a generator nobody
+    // can compare against a fix.
+    var a: [16]u8 = undefined;
+    var b: [16]u8 = undefined;
+    try testing.expectEqualStrings(fingerprint("hello", &a), fingerprint("hello", &b));
+
+    // And different names differ, or the checksum half is not doing its job.
+    var c: [16]u8 = undefined;
+    try testing.expect(!std.mem.eql(u8, fingerprint("hello", &a), fingerprint("world", &c)));
 }
 
 test "destinations are unique and relative" {
