@@ -4,9 +4,17 @@
 //!   zig build zeex-live -Dzscript=true -- --once path/to/template.jsx    one pass, then exit
 //!
 //! This is the first half of the live editor: the feedback loop that turns a keystroke into
-//! "here is the Zig your template lowered to, or here is the line it rejected". The second
-//! half — evaluating the lowered expression and showing a value — is what the persistent
-//! `zigeval_listen` client exists for, and it is not wired in here yet.
+//! "here is the Zig your template lowered to, or here is the line it rejected".
+//!
+//! **`--preview` is wired to the evaluator and blocked one level down.** It renders the
+//! template for real — generated `render`, plus a props struct scanned out of the generated
+//! source, handed to `zigeval.Evaluator` as a prelude — but the evaluator's scratch file is a
+//! standalone `build-obj` with no module imports, so a prelude cannot reach `zurtr` and the
+//! preview reports the compiler's own `no module named 'zurtr' available within module 'eval'`.
+//! Two ways out, neither taken yet: give the evaluator an option to pass `--dep`/`-M` for a
+//! module graph (absolute paths, so the editor's build would embed them), or stop using the
+//! evaluator here and build a scratch package incrementally, which trades the 2.7 ms eval for
+//! a small `zig build` per keystroke. The props scanner below is written and correct either way.
 //!
 //! Two things carried over from the evaluator, because both cost an afternoon to learn:
 //!
@@ -19,6 +27,7 @@
 
 const std = @import("std");
 const zurtr = @import("zurtr");
+const zigeval = @import("zigeval");
 
 /// Lowered once at startup to warm the engine. Deliberately small: it only has to be a
 /// template the transform walks end to end — an element, an interpolation, a conditional.
@@ -33,6 +42,11 @@ const Options = struct {
     path: []const u8,
     once: bool = false,
     interval_ms: u64 = 250,
+    /// Render the template and print the HTML, instead of the Zig it lowered to.
+    preview: bool = false,
+    /// The compiler the preview evaluates with. From $ZIG_EXE when it is set; the evaluator's
+    /// header explains why an unset one costs 5x on a machine with a launcher shim.
+    zig_exe: []const u8 = "zig",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -45,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &out_writer.interface;
     defer out.flush() catch {};
 
-    const options = parseOptions(args) catch {
+    var options = parseOptions(args) catch {
         try out.writeAll(
             \\usage: zeex-live [--once] <template.jsx>
             \\
@@ -53,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
 
         return;
     };
+    options.zig_exe = init.environ_map.get("ZIG_EXE") orelse "zig";
 
     // Warm-up (see the header): pay the engine's first call here, and say what it cost.
     {
@@ -68,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
         try out.flush();
     }
 
-    lower(gpa, io, out, options.path) catch |err| {
+    lower(gpa, io, out, options.path, options) catch |err| {
         try out.print("zeex-live: {s}\n", .{@errorName(err)});
         // `--once` is the scriptable mode: a file it cannot read is an exit code, not a loop.
         if (options.once) return err;
@@ -90,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
                 last = now;
                 // In the loop a rejection is normal — you are mid-keystroke — so it is
                 // reported and the loop continues.
-                lower(gpa, io, out, options.path) catch {};
+                lower(gpa, io, out, options.path, options) catch {};
             }
         }
         std.Io.sleep(io, .fromMilliseconds(@intCast(options.interval_ms)), .awake) catch {};
@@ -102,6 +117,8 @@ fn parseOptions(args: []const [:0]const u8) !Options {
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--once")) {
             options.once = true;
+        } else if (std.mem.eql(u8, arg, "--preview")) {
+            options.preview = true;
         } else if (std.mem.startsWith(u8, arg, "--interval=")) {
             options.interval_ms = try std.fmt.parseInt(u64, arg["--interval=".len..], 10);
         } else if (options.path.len == 0) {
@@ -116,7 +133,7 @@ fn parseOptions(args: []const [:0]const u8) !Options {
 }
 
 /// Reads the template, lowers it, and reports the result: the errors, or the generated Zig.
-fn lower(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, path: []const u8) !void {
+fn lower(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, path: []const u8, options: Options) !void {
     const source = try readFile(gpa, io, path);
     defer gpa.free(source);
 
@@ -146,6 +163,8 @@ fn lower(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, path: []const 
         return;
     }
 
+    if (options.preview) return preview(gpa, io, out, path, generated, options);
+
     try out.print("{s}: {d} bytes of Zig, parses clean ({d:.1} ms)\n", .{ path, generated.len, elapsed });
     try out.print("{s}\n", .{generated});
 
@@ -153,6 +172,173 @@ fn lower(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, path: []const 
     // flushed as it is produced. Without this the tool prints nothing at all in the mode
     // it exists for, which is exactly what happened the first time it was started.
     try out.flush();
+}
+
+/// Renders the template for real: the generated `render` plus a `props` built from the paths
+/// it uses, handed to the persistent evaluator as a prelude. This is the half the evaluator
+/// exists for — one long-lived compiler, a template per keystroke, and the HTML that came out.
+fn preview(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    out: *std.Io.Writer,
+    path: []const u8,
+    generated: []const u8,
+    options: Options,
+) !void {
+    const uses = try scanProps(gpa, generated);
+    defer gpa.free(uses);
+
+    var prelude: std.Io.Writer.Allocating = .init(gpa);
+    defer prelude.deinit();
+    try buildPrelude(&prelude.writer, generated, uses);
+
+    // The evaluator's first call is the expensive one, so it happens here rather than on the
+    // first save: this is the startup warm-up the client was written to make possible.
+    const started = std.Io.Timestamp.now(io, .awake);
+    const evaluator = try zigeval.Evaluator.create(gpa, io, .{
+        .zig_exe = options.zig_exe,
+        .work_dir = ".zig-cache/zeex-live",
+        .prelude = prelude.written(),
+    });
+    defer evaluator.destroy();
+
+    const result = try evaluator.eval("previewHtml()");
+    defer result.deinit(gpa);
+
+    switch (result) {
+        .value => |html| {
+            try out.print("{s}: preview {d} bytes ({d:.1} ms, {d} prop(s))\n", .{
+                path, html.len, msSince(io, started), uses.len,
+            });
+            try out.print("{s}\n", .{html});
+        },
+        .errors => |errors| {
+            try out.print("{s}: the preview did not compile ({d:.1} ms)\n{s}", .{ path, msSince(io, started), errors });
+        },
+    }
+    try out.flush();
+}
+
+/// The prelude the evaluator compiles: the generated template verbatim, a props struct whose
+/// shape came from scanning it, and a function that renders and returns the HTML.
+fn buildPrelude(w: *std.Io.Writer, generated: []const u8, uses: []const PropUse) !void {
+    // The default prelude is replaced, not extended, so the imports the generated code and
+    // this wrapper need are named here.
+    // Only `std`: the generated file brings its own `zurtr` import, and two of them in one
+    // file is a duplicate declaration.
+    try w.writeAll("const std = @import(\"std\");\n\n");
+
+    // The generated file opens with a `//!` header, and the prelude is *appended* to the
+    // evaluator's scratch file — where a document comment is not the file header and Zig
+    // rejects it. Demoted to a line comment as it is written, because a prelude cannot
+    // reorder the file it is pasted into.
+    var lines = std.mem.splitScalar(u8, generated, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "//!")) {
+            try w.print("// {s}\n", .{line["//!".len..]});
+        } else {
+            try w.print("{s}\n", .{line});
+        }
+    }
+    try w.writeAll(
+        \\
+        \\const PreviewProps = struct {
+        \\
+    );
+    for (uses) |use| try w.print("    {s}: {s},\n", .{ use.name, switch (use.kind) {
+        .boolean => "bool",
+        .strings => "[]const []const u8",
+        .text => "[]const u8",
+    } });
+    try w.writeAll(
+        \\};
+        \\
+        \\const preview_props = PreviewProps{
+        \\
+    );
+    for (uses) |use| {
+        // The prop's own name is its value, so the preview shows which name reached which
+        // position instead of rendering an empty page.
+        switch (use.kind) {
+            .boolean => try w.print("    .{s} = true,\n", .{use.name}),
+            .strings => try w.print("    .{s} = &.{{}},\n", .{use.name}),
+            .text => try w.print("    .{s} = \"{s}\",\n", .{ use.name, use.name }),
+        }
+    }
+    try w.writeAll(
+        \\};
+        \\
+        \\fn previewHtml() []const u8 {
+        \\    @setEvalBranchQuota(4_000_000);
+        \\    var buffer: [64 * 1024]u8 = undefined;
+        \\    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+        \\    const gpa = fixed.allocator();
+        \\    var tree = zurtr.live.tree.Tree.init(gpa);
+        \\    defer tree.deinit();
+        \\    var builder = zurtr.live.tree.Builder.init(&tree);
+        \\    defer builder.deinit();
+        \\    render(preview_props, &builder) catch unreachable;
+        \\    const html = tree.writeHtmlAlloc(gpa, builder.root()) catch unreachable;
+        \\    return gpa.dupeZ(u8, html) catch unreachable;
+        \\}
+        \\
+    );
+}
+
+/// What a template needs from `props`, read off the generated source.
+///
+/// `props: anytype` is the reason this is possible at all: the template's names became field
+/// accesses in the generated code, so the shape of the struct a preview needs is spelled out
+/// in a file we just produced. Three forms, decided by the construct that uses the path:
+/// a conditional wants a bool, an iteration wants a slice of strings, and anything reaching
+/// `b.text`/`b.raw`/an attribute wants a string. A component call cannot be fabricated and is
+/// reported rather than guessed.
+const PropUse = struct {
+    name: []const u8,
+    kind: Kind,
+
+    const Kind = enum { boolean, strings, text };
+};
+
+fn scanProps(gpa: std.mem.Allocator, generated: []const u8) ![]PropUse {
+    var uses: std.ArrayList(PropUse) = .empty;
+    errdefer uses.deinit(gpa);
+
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, generated, index, "props.")) |at| {
+        const after = at + "props.".len;
+        var end = after;
+        while (end < generated.len and (std.ascii.isAlphanumeric(generated[end]) or generated[end] == '_')) end += 1;
+        if (end == after) {
+            index = after;
+
+            continue;
+        }
+        const name = generated[after..end];
+
+        // `for (props.x)` is iteration, `if (props.x)` is a conditional, everything else is text.
+        const line_start = if (std.mem.lastIndexOfScalar(u8, generated[0..at], '\n')) |nl| nl + 1 else 0;
+        const prefix = std.mem.trimStart(u8, generated[line_start..at], " ");
+        const kind: PropUse.Kind = if (std.mem.startsWith(u8, prefix, "for ("))
+            .strings
+        else if (std.mem.startsWith(u8, prefix, "if ("))
+            .boolean
+        else
+            .text;
+
+        var seen = false;
+        for (uses.items) |use| {
+            if (std.mem.eql(u8, use.name, name)) {
+                seen = true;
+            }
+        }
+        // A name used twice with different kinds is left as the first one; the preview will
+        // fail to compile and the evaluator's error message will say which line.
+        if (!seen) try uses.append(gpa, .{ .name = name, .kind = kind });
+        index = end;
+    }
+
+    return uses.toOwnedSlice(gpa);
 }
 
 /// The change detector: a digest of the *content*. Metadata is what the compiler's

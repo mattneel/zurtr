@@ -118,6 +118,15 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "quickjs", .module = quickjs }},
     });
 
+    // The build-time evaluator as a named module. Its own self-test drives it through
+    // `zig run`; a consumer (the live editor) needs it importable, and a relative import
+    // cannot leave a module's path.
+    const zigeval = b.createModule(.{
+        .root_source_file = b.path("tools/zigeval_listen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // --- zurtr --------------------------------------------------------------
     const zurtr_options = b.addOptions();
     zurtr_options.addOption(bool, "turso", enable_turso);
@@ -315,7 +324,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/zeex_live.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zurtr", .module = zurtr }},
+            .imports = &.{
+                .{ .name = "zurtr", .module = zurtr },
+                .{ .name = "zigeval", .module = zigeval },
+            },
         });
         const zeex_live = b.addExecutable(.{ .name = "zeex-live", .root_module = zeex_live_module });
         zeex_live.use_llvm = true;

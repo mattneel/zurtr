@@ -264,13 +264,6 @@ fn interpret(gpa: Allocator, bundle: ErrorBundle, nonce: u64) !Result {
         if (!std.mem.eql(u8, msg, compile_log_msg)) real_errors += 1;
     }
 
-    // Behaviour 6: the log text is one line per logging call in the update, so exactly
-    // two lines are ours — the nonce and the expression's value. Anything else means
-    // something in the update logged, and the "value" would be a concatenation of the
-    // two. Refusing is the whole point: silently returning the concatenation is how a
-    // side-channel becomes a wrong answer with no error.
-    if (log_text.len != 0 and std.mem.count(u8, log_text, "\n") != 2) return error.UnattributableResult;
-
     if (real_errors != 0) {
         var aw: Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
@@ -280,6 +273,17 @@ fn interpret(gpa: Allocator, bundle: ErrorBundle, nonce: u64) !Result {
         }, &aw.writer);
         return .{ .errors = try aw.toOwnedSlice() };
     }
+
+    // Behaviour 6: the log text is one line per logging call in the update, so exactly two
+    // lines are ours — the nonce and the expression's value. Anything else means something in
+    // the update logged, and the "value" would be a concatenation of the two. Refusing is the
+    // whole point: silently returning the concatenation is how a side-channel becomes a wrong
+    // answer with no error.
+    //
+    // This runs *after* the error branch on purpose. An expression that fails to compile
+    // produces errors and no value line, which is a real answer with a real message; checking
+    // shape first reported those as unattributable and hid the compiler's own diagnostic.
+    if (log_text.len != 0 and std.mem.count(u8, log_text, "\n") != 2) return error.UnattributableResult;
 
     if (log_text.len == 0) return error.NoCompileLogOutput;
 
@@ -542,6 +546,24 @@ test "an expression that logs is refused, not concatenated into a value" {
     var bundle2 = try wip2.toOwnedBundle("@as(u64, 8)\n@as(comptime_int, 2)\nhelper says hi\n");
     defer bundle2.deinit(gpa);
     try std.testing.expectError(error.UnattributableResult, interpret(gpa, bundle2, 8));
+}
+
+test "a compile error is answered with the errors, not with a shape complaint" {
+    const gpa = std.testing.allocator;
+    var wip: ErrorBundle.Wip = undefined;
+    try wip.init(gpa);
+    defer wip.deinit();
+    try wip.addRootErrorMessage(.{ .msg = try wip.addString("no field named 'title'") });
+
+    // What an expression that fails to compile looks like: one error, and a log text holding
+    // only the nonce, because the value line was never produced.
+    var bundle = try wip.toOwnedBundle("@as(u64, 4)\n");
+    defer bundle.deinit(gpa);
+
+    const result = try interpret(gpa, bundle, 4);
+    defer result.deinit(gpa);
+    try std.testing.expect(result == .errors);
+    try std.testing.expect(std.mem.indexOf(u8, result.errors, "no field named 'title'") != null);
 }
 
 test "a result carrying an older nonce is rejected, never returned" {
