@@ -287,6 +287,7 @@ pub fn build(b: *std.Build) void {
     // gets its own step rather than riding inside `test-zurtr`, where a failure in it would be
     // indistinguishable from a failure anywhere else in that binary.
     var zeex_test_run: ?*std.Build.Step.Run = null;
+    var zeex_live_test_run: ?*std.Build.Step.Run = null;
     if (enable_zscript) {
         const zeex_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -306,6 +307,34 @@ pub fn build(b: *std.Build) void {
         zeex_test_run = run_zeex_tests;
     }
 
+    if (enable_zscript) {
+        // zeex-live: the live editor's first half — lower a template on every save and show
+        // the Zig it produced, or the line it rejected. Built from the framework module
+        // because a `tools/` root cannot reach `src/` by relative path.
+        const zeex_live_module = b.createModule(.{
+            .root_source_file = b.path("tools/zeex_live.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zurtr", .module = zurtr }},
+        });
+        const zeex_live = b.addExecutable(.{ .name = "zeex-live", .root_module = zeex_live_module });
+        zeex_live.use_llvm = true;
+        zeex_live.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
+        b.installArtifact(zeex_live);
+        const run_zeex_live = b.addRunArtifact(zeex_live);
+        run_zeex_live.addPassthruArgs();
+        const zeex_live_step = b.step("zeex-live", "Lower a template on every save (the live editor's compiler half)");
+        zeex_live_step.dependOn(&run_zeex_live.step);
+
+        const zeex_live_tests = b.addTest(.{ .root_module = zeex_live_module });
+        zeex_live_tests.use_llvm = true;
+        zeex_live_tests.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
+        const run_zeex_live_tests = b.addRunArtifact(zeex_live_tests);
+        const test_zeex_live_step = b.step("test-zeex-live", "Run the live editor's tests");
+        test_zeex_live_step.dependOn(&run_zeex_live_tests.step);
+        zeex_live_test_run = run_zeex_live_tests;
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zurtr_tests.step);
     test_step.dependOn(&run_zix_tests.step);
@@ -313,4 +342,5 @@ pub fn build(b: *std.Build) void {
     if (nodes_test_run) |run| test_step.dependOn(&run.step);
     if (script_test_run) |run| test_step.dependOn(&run.step);
     if (zeex_test_run) |run| test_step.dependOn(&run.step);
+    if (zeex_live_test_run) |run| test_step.dependOn(&run.step);
 }
