@@ -36,7 +36,7 @@ Four errors, exactly:
 | Error | Means | Does it say what? |
 | :- | :- | :- |
 | `TemplateRejected` | the template did not parse, or used something outside the subset | yes — the script's own message, with the line number |
-| `MalformedIr` | the IR is not one this emitter understands | partly: a component carrying children, and a non-empty `otherwise`, print what they refused; an unknown op or attribute kind returns silently |
+| `MalformedIr` | the IR is not one this emitter understands | partly: a non-empty `otherwise` prints what it refused; an unknown op, attribute kind, or a path naming a value this scope cannot reach returns silently |
 | `TransformFailed` | the engine could not be started | no |
 | `OutOfMemory` | allocation failed | no |
 
@@ -81,6 +81,7 @@ Accepted — everything else is refused:
 | conditional (no `else`) | `{props.show && <p>{props.body}</p>}` |
 | iteration, function or arrow | `{props.items.map(item => <li>{item}</li>)}`, and the ES5 `function (item) { … }` form |
 | component call (a capitalised tag) | `<Card title={props.title}/>` |
+| children on a component, as that component's slot | `<Card><p>{props.body}</p></Card>` |
 
 Refused, **with the line number**:
 
@@ -94,7 +95,6 @@ Refused, **with the line number**:
 - a loop variable named `b`, `props` or `zurtr`, or one an enclosing loop already
   bound: the emitter writes the name into `for (…) |name|` verbatim, so those
   would shadow something the generated function needs;
-- children on a component (below);
 - a bare `}` that opens no interpolation, an unterminated element/interpolation,
   trailing input, and an attribute value that is neither quoted nor braced.
 
@@ -102,7 +102,7 @@ Boundaries worth stating as boundaries:
 
 - there is no `else` and no ternary: only `{cond && <el>}`;
 - iteration is single-variable; a loop variable cannot itself be iterated;
-- a component takes attributes only (see below);
+- a component's children are a slot it may render, or ignore (see below);
 - a void element's children are not parsed: `<br>x</br>` is a closing tag without
   an opening tag, not an ignored child.
 
@@ -117,7 +117,7 @@ Six ops, and the emitter has a branch for each; anything else is `MalformedIr`.
 | `raw` | `{path}` | `try b.raw(props.x);` (never escaped) |
 | `if` | `{path, then, otherwise}` | `if (props.x) { … }` (`otherwise` must be empty) |
 | `for` | `{path, item, body}` | `for (props.x) |item| { … }` |
-| `element` | `{tag, attrs, children}` | see "Components" |
+| `element` | `{tag, attrs, children}` | see "Components": children become a slot when the tag is capitalised |
 
 A path is an array. `["$item"]` — the `$` form — is the enclosing `for`'s loop
 variable and must be a single segment; anything else is a field of `props`, so a
@@ -127,25 +127,81 @@ attribute: present, rendered as an empty value, which is what an HTML boolean
 attribute means). `AttrSpec.value == null` would *omit* an attribute, so a bare
 attribute must not go that route.
 
-## Components are a spelling convention
+## Components: a capitalised tag, and children as a slot
 
-A capitalised tag is a component call. `props` carries the component, the
-attributes become its argument struct, and the Builder comes last:
+A capitalised tag is a component call. `props` carries the component as a
+*declaration*, the attributes become its argument struct, and the call is a
+namespace call — `@TypeOf(props).Card(…)`, never `props.Card(…)`, which would
+bind `props` as a method receiver and pass one argument too many:
 
 ```
-<Card title={props.title}/>   →   try props.Card(.{ .title = props.title }, b);
+<Card title={props.title}/>
+```
+```zig
+try @TypeOf(props).Card(.{ .title = props.title, .children = @as(?Slot0, null) }, b);
 ```
 
-A lowercase tag becomes the render-tree calls instead — `try b.element("div",
-&.{ …attrs… }, 0);`, then its children, then `try b.close();`.
+A lowercase tag becomes the render-tree calls instead: `try b.element("div", &.{ …attrs… }, 0);`,
+then its children, then `try b.close();`.
 
-**Open: a component may not take children.** Children are currently *refused*
-(`<Card><p>…</p></Card>` is a `TemplateRejected` naming the line), because the
-emitter has nowhere to put them and silently dropping them is worse. Whether a
-component takes them as `props.children`, takes a fragment, or stays
-unsupported is a product decision that has not been made; the emitter also
-refuses an IR that carries children for a capitalised tag, so a second producer
-cannot reintroduce the silent drop.
+**A component's children become a slot the component calls.** The children are lowered into a generated
+struct with a `render` method, and the component decides whether, when and how often to call it — a
+LiveView component's `inner_block`:
+
+```
+<Card title="t"><p>{props.body}</p></Card>
+```
+```zig
+const Slot0 = struct {
+    props: @TypeOf(props),
+    pub fn render(self: @This(), slot_b0: *zurtr.live.tree.Builder) anyerror!void {
+        try slot_b0.element("p", &.{}, 0);
+        try slot_b0.text(self.props.body);
+        try slot_b0.close();
+    }
+};
+try @TypeOf(props).Card(.{ .title = "t", .children = @as(?Slot0, .{ .props = props }) }, b);
+```
+
+The component's side is one line, and it names no generated type:
+
+```zig
+pub fn Card(attrs: anytype, b: *zurtr.live.tree.Builder) !void {
+    try b.element("card", &.{}, 0);
+    if (attrs.children) |slot| try slot.render(b); // null when the tag had no children
+    try b.close();
+}
+```
+
+`attrs.children` is always present, and `null` for a tag with none — the `inner_block`-absent case.
+Component parameters are therefore `anytype` (as they already were): a slot's type is generated at the
+call site, so no component could name it.
+
+### What a slot carries, and why it is a value
+
+The children are written in the *caller's* template, so they name the caller's values. A slot carries
+each one it uses **by value** — the caller's `props`, and every enclosing loop variable the children
+reference (`item: @TypeOf(item)`), reached inside as `self.item`. Both reasons are structural:
+
+- **A nested function cannot read the enclosing function's runtime values.** Reading a runtime field of
+  `props` from inside the generated `fn render` fails to compile (`"props" not accessible from inner
+  function`) as soon as the caller's props is a named struct value rather than a comptime-known literal.
+  So a function-pointer slot (`?*const fn (*Builder) anyerror!void`, the shape this convention was first
+  sketched as) cannot carry the caller's props at all; making it work needs a `*anyopaque` context and a
+  cast at every call — more machinery, and an unsafe one.
+- **A loop variable cannot be captured at all**, so without carrying, a `<Card>` inside a `map` could not
+  use the item — the most common thing a slot wants to render.
+
+The cost is a copy: constructing a component call copies the caller's props and each loop variable the
+children use. Props are small view structs, and a slot that outlives the call holds slices of the
+caller's data, like any other value.
+
+Names the generated code owns are refused as loop variables, with the line number: `b`, `props`,
+`zurtr`, `self`, `render`, and anything matching `slot_b<N>` or `Slot<N>`.
+
+Why this shape at all: a template language that has to know where a component puts its content is a
+layout engine; a component system lets the component decide. The slot is the smallest Zig value with
+that property — the component calls it, or does not.
 
 ## What the compiler trusts, and what it does not
 
@@ -173,9 +229,11 @@ gated through its module root instead of getting a step of their own
 
 The tests pin: the generated source parses (`std.zig.Ast`, the compiler's own
 parser, printing the source and token positions when it does not); a bare
-attribute lowers to a present attribute with an empty value; and the refusals come
-back as `TemplateRejected` — component children, an expression after `props.`,
-a loop variable the generated code binds.
+attribute lowers to a present attribute with an empty value; a component with
+children emits the slot and passes it, a component without them passes `null`, and
+a slot carries the loop variables its children use; and the refusals come back as
+`TemplateRejected` — an expression after `props.`, and a loop variable named after
+something the generated code binds.
 
 They do **not** pin the generated code's types, and they cannot run without
 `-Dzscript`, so a base build exercises none of this.
@@ -187,6 +245,5 @@ They do **not** pin the generated code's types, and they cannot run without
   and writes/imports the result itself.
 - No schema for `props`: the caller's struct is the contract, which is the point,
   but nothing checks that two templates rendering the same shape agree.
-- Component children (open, above).
 - The transform is a hand-written parser over a closed subset; it is not a JSX
   implementation, and it does not intend to become one.
