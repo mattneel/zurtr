@@ -28,6 +28,10 @@ pub const live = struct {
     pub const protocol = @import("live/protocol.zig");
     /// The worker's bus: sessions subscribe to topics, committed writes publish to them.
     pub const pubsub = @import("live/pubsub.zig");
+    /// The render tree a generated template writes into. ZEEX names this in every file it emits
+    /// (`zurtr.live.tree.Builder`), so it is not an internal detail of this namespace: moving it
+    /// breaks templates, not just callers.
+    pub const tree = @import("live/tree.zig");
 };
 
 /// Domain: resources, typed actions, validation, authorization, relationships.
@@ -106,8 +110,17 @@ test {
     _ = runtime.task;
     _ = live.protocol;
     _ = live.pubsub;
+    _ = live.tree;
     _ = data;
     _ = domain;
     _ = jobs;
     if (comptime @import("build_options").zscript) _ = zeex;
+
+    // ZEEX writes `@import("zurtr")` and `zurtr.live.tree.Builder` into every generated file, and its
+    // own test can only parse that output for syntax — a semantic lookup fails in a user's build, not
+    // in the compiler's test. So the names it depends on are checked here, where both sides are visible.
+    comptime {
+        if (!@hasDecl(live, "tree")) @compileError("zeex emits zurtr.live.tree.Builder, but live has no `tree`");
+        if (!@hasDecl(live.tree, "Builder")) @compileError("zeex emits zurtr.live.tree.Builder, but there is no `Builder`");
+    }
 }
