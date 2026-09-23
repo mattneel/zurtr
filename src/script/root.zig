@@ -150,14 +150,14 @@ pub const Script = struct {
                 else => literal.append(allocator, byte) catch return error.ScriptThrew,
             }
         }
-        literal.append(allocator, ')') catch return error.ScriptThrew;
+        literal.append(allocator, '"') catch return error.ScriptThrew;
 
         var call = std.ArrayList(u8).empty;
         defer call.deinit(allocator);
         call.appendSlice(allocator, name) catch return error.ScriptThrew;
         call.append(allocator, '(') catch return error.ScriptThrew;
-        call.appendSlice(allocator, literal.items[0 .. literal.items.len - 1]) catch return error.ScriptThrew;
-        call.appendSlice(allocator, "))") catch return error.ScriptThrew;
+        call.appendSlice(allocator, literal.items) catch return error.ScriptThrew;
+        call.append(allocator, ')') catch return error.ScriptThrew;
 
         // The engine parses its input as a C string, so the call is terminated before it is evaluated.
         call.append(allocator, 0) catch return error.ScriptThrew;

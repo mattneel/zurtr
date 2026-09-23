@@ -401,13 +401,20 @@ test "pool enforces the pending bound" {
     }
     try testing.expect(full_hits > 0);
 
-    // Drain everything that completes so deinit has nothing left to free.
+    // Drain everything that completes so deinit has nothing left to free, and count what came back:
+    // the bound test's real claim is that the pool ran exactly what it accepted, no more and no less.
     var buf: [64]Completion = undefined;
+    var drained: usize = 0;
     var guard: usize = 0;
-    while ((pool.completed_count + pool.completionCount() < 64 - full_hits) and guard < 1_000) : (guard += 1) {
+    while (guard < 1_000) : (guard += 1) {
         const n = pool.drainBlocking(&buf, 50);
         for (buf[0..n]) |c| pool.freePayload(c.payload);
+        drained += n;
+        // Quiet means nothing accepted is still queued and nothing completed is undrained.
+        if (drained == 64 - full_hits and pool.pendingCount() == 0 and pool.completionCount() == 0) break;
     }
+    try testing.expectEqual(@as(usize, 64 - full_hits), drained);
+    try testing.expectEqual(@as(usize, 0), pool.pendingCount());
     try testing.expectEqual(@as(usize, 0), pool.completionCount());
 }
 

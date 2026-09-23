@@ -44,7 +44,10 @@ pub fn compile_template(allocator: std.mem.Allocator, template: []const u8) Erro
     script.load("transform.js", transform_source, 1) catch return error.TemplateRejected;
 
     const ir_json = script.callText("transform", template, allocator) catch {
-        // The script's own message for a rejected template is the useful part.
+        // The script's own message for a rejected template is the useful part: a compiler that cannot say
+        // which line it gave up on is not much of a compiler.
+        std.debug.print("zeex: {s}\n", .{script.errorDetail()});
+
         return error.TemplateRejected;
     };
     defer allocator.free(ir_json);
@@ -90,15 +93,19 @@ fn generate(allocator: std.mem.Allocator, ir_json: []const u8) Error![:0]u8 {
     return terminated[0..bytes.len :0];
 }
 
-fn indent(w: anytype, depth: usize) !void {
+fn indent(w: anytype, depth: usize) std.Io.Writer.Error!void {
     for (0..depth) |_| try w.writeAll("    ");
 }
 
-fn emitNodes(w: anytype, nodes: []const std.json.Value, depth: usize) !void {
+/// The emitter's error set, named because `emitNodes`/`emitNode` are mutually recursive and Zig cannot
+/// infer an error set through a cycle.
+const EmitError = std.Io.Writer.Error || error{MalformedIr};
+
+fn emitNodes(w: anytype, nodes: []const std.json.Value, depth: usize) EmitError!void {
     for (nodes) |node| try emitNode(w, node, depth);
 }
 
-fn emitNode(w: anytype, node: std.json.Value, depth: usize) !void {
+fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
     const object = node.object;
     const op = object.get("op") orelse return error.MalformedIr;
     const name = op.string;
@@ -106,7 +113,7 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) !void {
     if (std.mem.eql(u8, name, "text")) {
         const value = object.get("value").?.string;
         try indent(w, depth);
-        try w.print("try b.text({f});\n", .{std.zig.fmtString(value)});
+        try w.print("try b.text(\"{f}\");\n", .{std.zig.fmtString(value)});
 
         return;
     }
@@ -160,7 +167,7 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) !void {
         // attributes become its argument struct — the JSX convention, lowered rather than interpreted.
         if (tag.len > 0 and std.ascii.isUpper(tag[0])) {
             try indent(w, depth);
-            try w.print("try props.{s}(.{", .{tag});
+            try w.print("try props.{s}(.{{", .{tag});
             if (object.get("attrs")) |attrs| {
                 for (attrs.array.items, 0..) |attr, index| {
                     const attr_name = attr.object.get("name").?.string;
@@ -176,7 +183,7 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) !void {
         }
 
         try indent(w, depth);
-        try w.print("try b.element({f}, &.{{", .{std.zig.fmtString(tag)});
+        try w.print("try b.element(\"{f}\", &.{{", .{std.zig.fmtString(tag)});
         if (object.get("attrs")) |attrs| {
             for (attrs.array.items, 0..) |attr, index| {
                 const attr_name = attr.object.get("name").?.string;
@@ -185,15 +192,14 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) !void {
 
                 if (index > 0) try w.writeAll(", ");
                 if (std.mem.eql(u8, kind, "static")) {
-                    try w.print(".{{ .name = {f}, .value = {f} }}", .{
+                    try w.print(".{{ .name = \"{f}\", .value = \"{f}\" }}", .{
                         std.zig.fmtString(attr_name),
                         std.zig.fmtString(value.object.get("value").?.string),
                     });
                 } else if (std.mem.eql(u8, kind, "path")) {
-                    try w.print(".{{ .name = {f}, .value = {s} }}", .{
-                        std.zig.fmtString(attr_name),
-                        pathText(value.object.get("path").?),
-                    });
+                    try w.print(".{{ .name = \"{f}\", .value = ", .{std.zig.fmtString(attr_name)});
+                    try pathText(w, value.object.get("path").?);
+                    try w.writeAll(" }");
                 } else {
                     return error.MalformedIr;
                 }
@@ -213,7 +219,7 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) !void {
 }
 
 /// Write the Zig expression for an attribute value: a path, a toggle, or the component form's value.
-fn emitAttrValue(w: anytype, value: std.json.Value) !void {
+fn emitAttrValue(w: anytype, value: std.json.Value) EmitError!void {
     const kind = value.object.get("kind").?.string;
 
     if (std.mem.eql(u8, kind, "path")) {
@@ -221,7 +227,7 @@ fn emitAttrValue(w: anytype, value: std.json.Value) !void {
     }
 
     if (std.mem.eql(u8, kind, "static")) {
-        return w.print("{f}", .{std.zig.fmtString(value.object.get("value").?.string)});
+        return w.print("\"{f}\"", .{std.zig.fmtString(value.object.get("value").?.string)});
     }
 
     return error.MalformedIr;
@@ -229,21 +235,20 @@ fn emitAttrValue(w: anytype, value: std.json.Value) !void {
 
 /// Write the Zig expression a path denotes: `["title"]` is `props.title`, `["$tag"]` is the loop variable
 /// `tag`. The two forms are distinct in the IR so a loop variable can never be mistaken for a property.
-fn pathText(w: anytype, path: std.json.Value) !void {
+fn pathText(w: anytype, path: std.json.Value) EmitError!void {
     if (path != .array or path.array.items.len == 0) return error.MalformedIr;
 
-    try w.writeAll("props");
-    for (path.array.items) |segment| {
-        const name = segment.string;
-        if (name.len > 0 and name[0] == '$') {
-            // A loop variable, bound by the enclosing `for`'s capture.
-            if (path.array.items.len != 1) return error.MalformedIr;
+    // A loop variable is an identifier the enclosing `for` binds; anything else is a field of props. The
+    // decision is made on the first segment, because writing `props.` first is not recoverable.
+    const head = path.array.items[0].string;
+    if (head.len > 0 and head[0] == '$') {
+        if (path.array.items.len != 1) return error.MalformedIr;
 
-            return w.print("{s}", .{name[1..]});
-        }
-
-        try w.print(".{s}", .{name});
+        return w.print("{s}", .{head[1..]});
     }
+
+    try w.writeAll("props");
+    for (path.array.items) |segment| try w.print(".{s}", .{segment.string});
 }
 
 test "a template lowers to Zig that parses, and the IR says what it should" {
@@ -263,8 +268,15 @@ test "a template lowers to Zig that parses, and the IR says what it should" {
 
     // The generated file must be valid Zig, which is the only thing that stops codegen bugs from
     // becoming a confusing error in a user's build. `std.zig.Ast` is the compiler's own parser.
-    var ast = try std.zig.Ast.parse(allocator, generated, .zig);
+    var ast = try std.zig.Ast.parse(allocator, generated, .{ .mode = .zig });
     defer ast.deinit(allocator);
+
+    // A codegen bug that only says "4 parse errors" is useless to whoever hits it, so say what was
+    // generated and where the parser gave up. That is the whole diagnostic.
+    if (ast.errors.len != 0) {
+        std.debug.print("zeex: generated source does not parse:\n{s}\n", .{generated});
+        for (ast.errors) |err| std.debug.print("  parse error at token {d}\n", .{err.token});
+    }
 
     try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
 }
