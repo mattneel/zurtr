@@ -132,7 +132,12 @@ attribute must not go that route.
 A capitalised tag is a component call. `props` carries the component as a
 *declaration*, the attributes become its argument struct, and the call is a
 namespace call — `@TypeOf(props).Card(…)`, never `props.Card(…)`, which would
-bind `props` as a method receiver and pass one argument too many:
+bind `props` as a method receiver and pass one argument too many. That is also
+what makes a component the props type does not declare a **compile error at the
+call site**, which is the same guarantee `props.title` gives for a field: this
+module's tests cannot see it (they parse the generated source), so it surfaces in
+the application's build — as intended, and worth knowing when a template "parses
+clean" while calling a component that does not exist.
 
 ```
 <Card title={props.title}/>
