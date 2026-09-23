@@ -19,7 +19,8 @@
 //!
 //! ```json
 //! {"attempt":1,"node":"node-a","pid":4242,"role":"leader","read":"ok","rows":0,"rows_after":1,
-//!  "write":"committed","lease_holder":"node-a","lease_mine":true}
+//!  "write":"committed","lease_holder":"node-a","lease_mine":true,"now_micros":1790190000000000,
+//!  "lease_until":null}
 //! ```
 //!
 //! `read` is `ok` or the error name the read failed with; `rows` is what the read saw *before* the
@@ -34,9 +35,10 @@
 //!     That is what holding means here: the lease is one row with an expiry, and a holder is a process
 //!     that keeps pushing that expiry forward. A node that stops renewing — because it exited, or
 //!     died — loses the lease when the expiry it last wrote passes, with no coordination step.
-//!   * `--retry-ms` waits that long after a *refused* write and attempts it once more. It is how a
-//!     follower exercises the recovery story: refused while the holder's lease is unexpired, taking
-//!     over once it has expired.
+//!   * `--retry-ms` is the budget for the wait after a *refused* write, and the write is attempted
+//!     once more when the wait ends. The wait watches the lease row and ends when the expiry has
+//!     passed, which is the wait a follower actually makes: refused while the holder's lease is
+//!     unexpired, taking over once it is not.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,7 +54,8 @@ const usage =
     \\
     \\Opens <path> at the distributed tier, then attempts one read and one write transaction. One JSON
     \\line per attempt goes to stdout; --hold-ms keeps the lease alive that long after the attempt, and
-    \\--retry-ms retries a refused write once, that long after the refusal.
+    \\--retry-ms is the budget for waiting, after a refusal, for the holder's lease to expire — the write
+    \\is then attempted once more.
     \\
 ;
 
@@ -124,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     if (options.retry_ms > 0 and std.mem.eql(u8, frame.first_write, "conflict")) {
         // The follower's half: wait out the holder's lease and try again, which is the whole recovery
         // story for a node that stopped renewing.
-        try Io.sleep(init.io, Io.Duration.fromMilliseconds(options.retry_ms), .awake);
+        try waitForExpiry(init.io, &db, options.node, options.retry_ms);
 
         try frame.retry(init.io, &db, try attempt(&db, options.write));
     }
@@ -231,6 +234,10 @@ const Report = struct {
     write: []const u8,
     lease_holder: ?[]const u8,
     lease_mine: bool,
+    /// This process's wall clock when it emitted the line, and the expiry of the lease row it read —
+    /// the two numbers a refusal is about, so a failure can be read instead of guessed at.
+    now_micros: i64,
+    lease_until: ?i64,
 };
 
 /// One process's run, and the line it prints per attempt.
@@ -253,6 +260,7 @@ const Frame = struct {
 
     fn write(self: *Frame, io: Io, db: *data.Database, outcome: Attempt) !void {
         const lease = try leaseHolder(db);
+        const now = nowMicros(io);
 
         var buffer: [4096]u8 = undefined;
         var file_writer: Io.File.Writer = .init(.stdout(), io, &buffer);
@@ -268,7 +276,11 @@ const Frame = struct {
             .rows_after = outcome.rows_after,
             .write = outcome.write,
             .lease_holder = if (lease) |held| held.holder[0..held.holder_len] else null,
-            .lease_mine = if (lease) |held| std.mem.eql(u8, held.holder[0..held.holder_len], self.node) else false,
+            // "Mine" has to mean held *and* unexpired: a stale row can carry this node's name from an
+            // earlier run of the same node, and reporting that as a claim would be a lie.
+            .lease_mine = if (lease) |held| std.mem.eql(u8, held.holder[0..held.holder_len], self.node) and held.until_micros > now else false,
+            .now_micros = now,
+            .lease_until = if (lease) |held| held.until_micros else null,
         }, .{}, stdout);
 
         try stdout.writeByte('\n');
@@ -282,19 +294,48 @@ const Frame = struct {
 /// exits next, and what it held expires on the lease's own clock.
 fn hold(io: Io, db: *data.Database, node: []const u8, hold_ms: i64) !void {
     const engine = adapter.engine(db);
-    const start = nowMicros(io);
+    // The deadline is in the clock's unit (microseconds), not the flag's: comparing a microsecond
+    // elapsed against a millisecond argument is a two-millisecond hold that looks like a working one
+    // from the outside until something has to be alive to be observed.
+    const until_micros = nowMicros(io) + Io.Duration.fromMilliseconds(hold_ms).toMicroseconds();
 
     while (true) {
         if (!try engine.claimLease(adapter.default_lease, node, nowMicros(io))) return error.LeaseLost;
-        if (nowMicros(io) - start >= hold_ms) return;
+        if (nowMicros(io) >= until_micros) return;
 
         try Io.sleep(io, Io.Duration.fromMilliseconds(renew_ms), .awake);
     }
 }
 
-/// How often a holder pushes its expiry forward. Well inside the lease's one-second life, so a
-/// renewal that lands late still lands before the expiry it is replacing.
+/// How often a holder pushes its expiry forward, and how often a follower looks at the lease while it
+/// waits for it. Well inside the lease's one-second life, so a renewal that lands late still lands
+/// before the expiry it is replacing.
 const renew_ms = 150;
+
+/// Wait, for up to `budget_ms`, for the lease to be free of another holder.
+///
+/// The wait watches the *row* — a follower can read the expiry, so it waits for that expiry instead of
+/// sleeping for a duration it guessed. `budget_ms` (the `--retry-ms` flag) is the bound, so a lease
+/// that never frees ends the wait and lets the attempt below fail loudly rather than hanging.
+fn waitForExpiry(io: Io, db: *data.Database, node: []const u8, budget_ms: i64) !void {
+    const deadline = nowMicros(io) + Io.Duration.fromMilliseconds(budget_ms).toMicroseconds();
+
+    while (nowMicros(io) < deadline) {
+        if (try leaseFree(adapter.engine(db), node, nowMicros(io))) return;
+
+        try Io.sleep(io, Io.Duration.fromMilliseconds(renew_ms), .awake);
+    }
+}
+
+/// Whether this node could take the lease now: no row at all, a row of its own, or a row whose expiry
+/// has passed. The same rule `claimLease` applies, read from the outside.
+fn leaseFree(engine: *adapter.Engine, node: []const u8, now_micros: i64) !bool {
+    const held = (try engine.leaseHolder(adapter.default_lease)) orelse return true;
+
+    if (std.mem.eql(u8, held.holder[0..held.holder_len], node)) return true;
+
+    return held.until_micros <= now_micros;
+}
 
 /// The wall clock in microseconds, the unit the lease is written in. The lease API takes the time as
 /// a parameter so callers own the clock; this is the harness's clock.

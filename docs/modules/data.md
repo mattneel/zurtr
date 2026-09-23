@@ -39,13 +39,13 @@ pub const TxMode = enum { read_write, read_only };
 - `Tx` is a handle, not thread-safe, not storable. It must be committed or
   rolled back explicitly; dropping it without either is a rollback plus a
   recorded diagnostic (`contracts.md` §3).
-- **Two execution modes in the adapter**, chosen by the caller's context:
-  - *parked* (reactor paths): the operation hands off to the event loop and
-    the HTTP handler parks; used by `app`/`live`.
-  - *blocking* (role processes: jobs/agents): the operation blocks the role
-    loop with a timeout and is retried on transient failure. Blocking mode is
-    never reachable from a reactor thread — the type of the calling context
-    decides (a `Ctx` in a reactor path has no blocking API).
+- **Execution mode is the caller's, not the adapter's.** The parked/blocking split in earlier revisions
+  of this contract is gone (`docs/architecture/decisions.md`, D1): the framework has two execution
+  classes — synchronous, and the `.ASYNC` lane, where a driver round trip parks the fiber and never the
+  worker. Here that means one adapter with one call shape: it blocks the role loop that calls it and
+  yields the fiber that calls it. Timeouts and retry policy for role processes live in the caller
+  (jobs/agents), which is where the taxonomy's `unavailable` and `timeout` classes become policy; the
+  adapter keeps no deadline of its own.
 - Errors are mapped to the framework taxonomy (`contracts.md` §5):
   `unavailable` (pool exhausted, connection lost), `conflict` (unique/FK
   violation, serialization failure), `timeout`, `syntax` (bug), `internal`.
@@ -167,37 +167,50 @@ loses it when the expiry passes and the next claimant takes over with no coordin
 
 Implemented for every tier (`Engine.claimLease`, `leaseHolder`, `releaseLease`), which is what makes it
 testable without a remote: two claimants, one winner, an expiry, and a stale holder that cannot release
-someone else's lease.
+someone else's lease. The recovery sentence above is a claim about a node that *does not* get to exit,
+so it is tested that way: `test-data-nodes` kills a holder mid-hold with `SIGKILL` and the survivor's
+takeover is asserted from its own output — see "Testing requirements" below.
 
 ## Declared: PostgreSQL
 
 - Transport: zix's `postgrez` driver (the vendored zix under `deps/zix`), which is where the PostgreSQL
-  protocol lives now that zurtr's transport is zix. Unlike the previous vendored swerver client it does
-  **not** park on the reactor, so the *parked* execution mode below is the work this adapter still
-  needs; the blocking mode is available today.
+  protocol lives now that zurtr's transport is zix. There is no parked mode to build for it (see
+  `docs/architecture/decisions.md`); the work this adapter still needs is the pool, the prepared-statement
+  cache and the decoders below.
 - Pool: N connections per worker (`DB_POOL_SIZE`, default 4 dev / 8 prod),
   lazily connected, health-checked on borrow, with connect timeout.
 - Prepared statements: server-side prepared statements cached per connection,
   keyed by SQL hash; `unknown`/`deallocate` handled on schema change.
-- `LISTEN`/`NOTIFY` support is exposed to `jobs` (see `jobs.md`).
+- `LISTEN`/`NOTIFY` is **not** implemented and nothing in the tree exposes it: this adapter does not
+  own a listener connection and `jobs` does not wait on one. Job wakeups go through the outbox path in
+  `jobs.md`, which does not need the database to push.
 - Types: binary format for all values; explicit decoders per `Value` tag;
   unknown OIDs surface as `text` bytes, never silently coerced.
 
 ## Testing requirements
 
-- Param encoding/decoding round-trips against a live database in the integration
-  test suite (`zurtr build test-db`), skipped when `ZURTR_DB_URL` is unset; unit
-  tests never require a database.
+- Param encoding/decoding round-trips against a live database are not in the suite today: every test
+  that exists runs without a server, and the one that needs a live *sync* endpoint is skipped unless
+  `-Dsync-remote=<url>` is given (below). There is no `test-db` step and no `ZURTR_DB_URL` anywhere in
+  the tree; a live-database integration suite arrives with the PostgreSQL adapter, which is declared and
+  not built.
+- The steps that exist: `zig build test-zurtr` (the framework), `zig build test-zix` (the vendored
+  transport), `zig build test-data -Dturso=true` and `zig build test-data-nodes -Dturso=true` (below),
+  and `zig build test-zscript -Dzscript=true` (the QuickJS layer). `zig build test` aggregates
+  whichever of them the configuration asked for.
 - Turso: `zig build test-data -Dturso=true` runs the tier tests — every value tag round-tripping,
   a unique violation mapping to `conflict`, commit and rollback semantics, reopen durability for the
   file tier, the write lease, and (with `-Dturso-sync=true`) the sync tier opening over a local file
   and refusing to pretend when its remote does not answer. It runs against the real native SDK Kit, and
   it is part of `zig build test -Dturso=true`.
-- Turso, across processes: `zig build test-data-nodes -Dturso=true` builds `src/data/node.zig` and runs
-  it twice, as two unrelated processes over one `.distributed` database file, asserting what each saw:
-  one writer at a time while the holder is alive, the follower's refusal, the takeover once the lease
-  expires, and both rows durable in the file afterwards. The pids are in the harness's output, so "two
-  processes" is checkable rather than assumed.
+- Turso, across processes: `zig build test-data-nodes -Dturso=true` builds `src/data/node.zig` and runs it
+  as two unrelated processes over one `.distributed` database file, twice over and both asserted: a
+  holder that *exits* without releasing (the follower reads its row, is refused with `conflict`, takes
+  over once the lease expires), and a holder that is **killed mid-hold** with `SIGKILL` (uncatchable, so
+  no handler, no flush and no release — the survivor opens the still-held file, sees exactly the killed
+  holder's committed row and nothing half-written, is refused by the dead holder's lease, and takes over
+  when it expires). The pids, the signal the holder died by and each attempt's outcome are in the
+  harness's output, so "two processes, killed not exited" is checkable rather than assumed.
 - Turso, against a live sync endpoint: `zig build test-data -Dturso=true -Dturso-sync=true
   -Dsync-remote=<url>` adds the round trip described under "The sync tier's remote"; without the flag
   that one test skips.
