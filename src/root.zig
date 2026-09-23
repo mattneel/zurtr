@@ -1,18 +1,18 @@
-//! By convention, root.zig is the root source file when making a package.
+//! zurtr — a native application framework built on swerver.
+//!
+//! Seven modules, compiled only when used:
+//!   Application, Live UI, Domain, Data, Jobs, Agents, Development.
+//!
+//! Nothing is implemented yet beyond the vendored transport; this root file is
+//! the seam where the module surface lands.
+
 const std = @import("std");
-const Io = std.Io;
 
-/// This is a documentation comment to explain the `printAnotherMessage` function below.
-///
-/// Accepting an `Io.Writer` instance is a handy way to write reusable code.
-pub fn printAnotherMessage(writer: *Io.Writer) Io.Writer.Error!void {
-    try writer.print("Run `zig build test` to run the tests.\n", .{});
-}
+/// Vendored swerver transport (deps/swerver). Re-exported so applications and
+/// modules above the framework can reach transport types without a direct
+/// dependency on the vendored path.
+pub const swerver = @import("swerver");
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test "zurtr module builds and links swerver" {
+    try std.testing.expect(@sizeOf(swerver.response.Response) > 0);
 }
