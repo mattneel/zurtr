@@ -95,6 +95,34 @@ create table zurtr_agent_signals (
 - Effects are never retried blindly on `unavailable` beyond the job-level retry
   policy; the step is retried by the agent queue with its own backoff.
 
+## Where the decision, the model and the script layer attach
+
+The model above deliberately says nothing about *how* a `Decision` is reached. Three things fill that in,
+and none of them changes the loop:
+
+- **Decisions from a model.** `ai.zig` (the stack's AI SDK implementation: `generateText`, `streamText`,
+  multi-step tool loops, `ToolLoopAgent`) produces exactly the shapes this contract already names: a tool
+  call is `Decision.call`, a clarifying turn is `Decision.ask`, a final answer is `Decision.done`. The
+  agent's tools *are* `domain` actions, so authorization, validation and transaction rules are the same
+  ones an HTTP request goes through. Provider choice, credentials and prompt assembly belong to the
+  application; this module records what was decided, not how.
+- **Decisions from a script.** `zurtr.script` may define `decide`/`apply` instead of Zig. What makes that
+  workable is the same thing that makes jzs's agent addons workable: the durable surface is exposed as
+  host functions — `emit`, `checkpoint`, `sleep`, `cancelRequested` — and the run's state is readable and
+  writable through `state.get/set/del/list`. A script cannot reach the database, the network or the
+  clock on its own; it reaches the host, and the host does the durable thing.
+- **State is outside the JavaScript heap.** The run's state lives in this module's tables through
+  `zurtr.data`, so a script reload changes the rules the *next* decision is made under and never erases a
+  run. That is the whole reason the layering is: script for behavior, this module for durability.
+
+### Revision pinning extends to scripts
+
+`version` above pins the workflow code a run executes. When `decide` or `apply` is script-defined, the run
+records **the script revision as well** — `{agent version, script revision}` is the unit that is pinned,
+and a run started under revision N finishes under N even when the host has loaded N+1
+(`contracts.md` §7). A retry, a recovery and a replayed step all execute the recorded revision, so a
+reload can never silently change what an in-flight run means.
+
 ## Tooling and inspection
 
 - `zurtr inspect agents` (dev only) lists runs, states, pending signals, and
@@ -115,3 +143,5 @@ create table zurtr_agent_signals (
 - Lease exclusivity: concurrent workers never decide for the same run twice.
 - Version pinning: a run created at version N completes on version N even when
   the code is deployed with version N+1.
+- Script pinning: a run whose decisions come from a script revision completes on that revision after the
+  host loads a newer one, and every decision it makes after the reload is the recorded revision's.
