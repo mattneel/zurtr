@@ -32,6 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        // The database binding, vendored at deps/turso (see its UPSTREAM.md). A path dependency, so
+        // nothing is fetched; its own native build (Turso compiled from Rust source) only runs when a
+        // build actually reaches the adapter, which is why the base build stays dependency-free.
+        .turso = .{ .path = "deps/turso" },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding

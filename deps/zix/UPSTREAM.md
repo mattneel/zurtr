@@ -36,4 +36,5 @@ Append one line per change; keep it current so re-vendoring is mechanical.
 |Date|Files|Change|
 |---|---|---|
 |2026-09-23|(whole tree)|Vendor at `5df894c` (`feat/webtransport`), unmodified.|
+|2026-09-23|(none yet)|Zig 0.17 test run at the pin: 2747/2749 pass; two TLS certificate tests abort in `std.crypto.Certificate.parse` (`index out of bounds: index 0, len 0`) inside `tls/client.zig`'s `verifyCertificateVerify`, which is a std behavior change rather than a zix source error. Not yet fixed: it is a panic on input the code does not control, so it needs a guard in `client.zig` (or a fixture update) with the certificate path re-checked, not a test silenced.|
 |2026-09-23|`src/udp/http3/webtransport/session.zig`|Zig 0.17 port: three `[_]u8{x} ** n` repetitions in tests became `@splat` with an explicit array type (`**` repetition is whitespace-checked out in 0.17). `@splat` is valid in 0.16 too, so zix's own 0.16 build is unaffected — verified by building zix at its own pin after the change. The same three edits are in the zix working tree at `feat/webtransport`, so a re-vendor carries them.|

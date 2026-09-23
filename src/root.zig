@@ -24,6 +24,13 @@ pub const live = struct {
     pub const protocol = @import("live/protocol.zig");
 };
 
+/// Data: queries, transactions, migrations, adapters.
+///
+/// The adapter itself is `data.turso`, which needs the vendored binding; the contract types here
+/// (`Value`, `Tier`, `Database`, `Tx`) do not, so a build that never asks for an adapter never pays
+/// for one.
+pub const data = @import("data/root.zig");
+
 /// What this build contains, for `zurtr modules` and `zurtr build --report`.
 ///
 /// The architecture names eight modules; this table says which of them exist in
@@ -46,7 +53,7 @@ pub const Module = struct {
 pub const modules = [_]Module{
     .{ .name = "runtime", .state = .implemented, .surface = "pool" },
     .{ .name = "live", .state = .implemented, .surface = "protocol" },
-    .{ .name = "data", .state = .declared, .surface = "adapter interface; PostgreSQL and Turso adapters" },
+    .{ .name = "data", .state = .implemented, .surface = "contract + Turso adapter (memory, file, sync, distributed)" },
     .{ .name = "domain", .state = .declared, .surface = "resources, typed actions, validation, authorization" },
     .{ .name = "jobs", .state = .declared, .surface = "durable queues, schedules, retries, cancellation" },
     .{ .name = "agents", .state = .declared, .surface = "signals, decisions, effects, checkpoints" },
@@ -61,4 +68,5 @@ test "zurtr module builds and links the transport" {
 test {
     _ = runtime.pool;
     _ = live.protocol;
+    _ = data;
 }

@@ -1,0 +1,29 @@
+.{
+    .name = .turso,
+    .version = "0.1.1",
+    .fingerprint = 0x18fb0b7e7b06fd7d, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.2264+230c63650",
+    .dependencies = .{
+        .turso_native = .{
+            .url = "https://github.com/tursodatabase/turso/archive/6e527a75595576790566f3d36560fbe95c5d87a2.tar.gz",
+            .hash = "N-V-__8AADSU3gJ2m0iao7tlMOrDWVZW3oJjYQEf7rh-RdUr",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "include",
+        "src",
+        "tests",
+        "tools",
+        "bench",
+        "examples",
+        "docs",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+    },
+}

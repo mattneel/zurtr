@@ -51,15 +51,48 @@ pub fn build(b: *std.Build) void {
     const brotli_dict = brotli_dict_run.addOutputFileArg("brotli_dictionary.bin");
     zix.addAnonymousImport("brotli_dictionary.bin", .{ .root_source_file = brotli_dict });
 
+    // --- turso (vendored, opt-in) -------------------------------------------
+    // The binding compiles Turso's native SDK from Rust source, so the base build must not need it.
+    // The module import is always declared (a Zig import name has to resolve even when the branch that
+    // uses it is dead), but nothing links the native library until something actually reaches the
+    // adapter — and only `-Dturso` builds are meant to.
+    const enable_turso = b.option(bool, "turso", "Build the Turso data adapter (compiles the native SDK from Rust source)") orelse false;
+    const turso_sync = b.option(bool, "turso-sync", "Include the opt-in Turso sync SDK Kit (implies -Dturso)") orelse false;
+
+    // Asking the package for its module is what asks for its native artifact, so a build that does not
+    // build the adapter must not ask: without `-Dturso` the import resolves to a guard file that says
+    // so, and cargo is never invoked.
+    const turso = if (enable_turso) blk: {
+        const turso_dep = b.dependency("turso", .{
+            .target = target,
+            .optimize = optimize,
+            .native = "source",
+            .linkage = "static",
+            .sync = turso_sync,
+        });
+
+        break :blk turso_dep.module("turso");
+    } else b.createModule(.{
+        .root_source_file = b.path("src/data/turso_not_built.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // --- zurtr --------------------------------------------------------------
+    const zurtr_options = b.addOptions();
+    zurtr_options.addOption(bool, "turso", enable_turso);
+    zurtr_options.addOption(bool, "turso_sync", turso_sync);
+
     const zurtr = b.addModule("zurtr", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zix", .module = zix },
+            .{ .name = "turso", .module = turso },
         },
     });
+    zurtr.addOptions("build_options", zurtr_options);
 
     // --- executable ---------------------------------------------------------
     // Applications deploy as one static executable, and this is the framework's own entry point
@@ -98,7 +131,29 @@ pub fn build(b: *std.Build) void {
     const test_zix_step = b.step("test-zix", "Run the vendored zix tests");
     test_zix_step.dependOn(&run_zix_tests.step);
 
+    // The data module's tests need a real database, so they are wired only when the adapter is built.
+    var data_test_run: ?*std.Build.Step.Run = null;
+    if (enable_turso) {
+        const data_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/data/tests.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "turso", .module = turso },
+                },
+            }),
+        });
+        data_tests.root_module.addOptions("build_options", zurtr_options);
+        // The adapter opens a file tier in a place it can clean up, so point the test at the cache.
+        const run_data_tests = b.addRunArtifact(data_tests);
+        const test_data_step = b.step("test-data", "Run the data module's tests against Turso");
+        test_data_step.dependOn(&run_data_tests.step);
+        data_test_run = run_data_tests;
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zurtr_tests.step);
     test_step.dependOn(&run_zix_tests.step);
+    if (data_test_run) |run| test_step.dependOn(&run.step);
 }
