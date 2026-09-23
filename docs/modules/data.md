@@ -145,12 +145,9 @@ covers the tier: that it opens over a local file with no server at all, and that
 remote that does not answer comes back as `error.Unavailable` — mapped, not a panic and not a silent
 success.
 
-What still needs a live endpoint, and one with credentials: the `auth_token` path. The tier's token is
-sent as the `Authorization` header's value on every request the engine makes, but every server this has
-been run against (`tursodb --sync-server`) has no authentication at all, so that header is unproven —
-the tests above pass `auth_token = null`. TLS is likewise proven only as far as "an https URL is
-accepted by the transport and dialled by it"; the round trips above are plain HTTP to a loopback host,
-which is the only scheme the transport allows without TLS.
+What the round trip does *not* cover — the token path, TLS, a kill inside a write, and one anomaly seen
+once — is written down under "Not proven here" below, so a reader does not have to infer it from the
+flags that happen to be in the test.
 
 What is deliberately *not* here: scheduling, retry and conflict policy. `pull` is one operation, not a
 loop; a `Busy`/`Conflict` outcome is the caller's to retry, and nothing runs in the background. Remote
@@ -170,6 +167,27 @@ testable without a remote: two claimants, one winner, an expiry, and a stale hol
 someone else's lease. The recovery sentence above is a claim about a node that *does not* get to exit,
 so it is tested that way: `test-data-nodes` kills a holder mid-hold with `SIGKILL` and the survivor's
 takeover is asserted from its own output — see "Testing requirements" below.
+
+### Not proven here
+
+Limits of the tiers above, stated so the next reader does not have to rediscover them:
+
+- **`auth_token` is untested.** The tier's token is forwarded verbatim as the `Authorization` header's
+  value, and every endpoint these tests have been run against (`tursodb --sync-server`) has no
+  authentication at all — the tests pass `auth_token = null`, so no server has ever checked that header.
+- **TLS is proven only as far as "an https URL is parsed and dialled by the client".** Both round trips
+  ran over plain HTTP to a loopback host, which is the only scheme the transport allows without TLS (the
+  cross-box run went through `fly proxy`, which keeps the URL loopback). A reader should take `https://`
+  in `remote` as accepted and dialled, not as verified against a certificate chain.
+- **The crash case kills a holder between transactions.** `test-data-nodes` proves that a `SIGKILL`ed
+  holder loses its lease when the expiry passes and that the file it held is afterwards readable, with
+  exactly the row it committed and nothing half-written. It says nothing about a process killed *inside*
+  a write.
+- **One anomaly, seen once and not reproduced:** a single-process (`.file`) open of a file written by the
+  engine's multiprocess mode saw fewer rows than the multiprocess writer had committed. It has not
+  recurred on demand, the two-process tests no longer read that way — they open at the tier they wrote
+  with — and nothing depends on the old behaviour. If a legacy open ever looks short of a multiprocess
+  write, start there.
 
 ## Declared: PostgreSQL
 
