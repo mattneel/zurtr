@@ -121,6 +121,63 @@ pub const Script = struct {
         };
     }
 
+    /// Call a script function with one string and read one string back, copying the result into
+    /// `allocator`. Used by build-time tooling — the ZEEX transform is a script the build runs.
+    ///
+    /// The argument crosses as a JSON string literal, which is valid JavaScript, so the escaping is done
+    /// once here rather than at every call site.
+    pub fn callText(
+        self: *Script,
+        name: [:0]const u8,
+        input: []const u8,
+        allocator: std.mem.Allocator,
+    ) Error![]u8 {
+        var literal = std.ArrayList(u8).empty;
+        defer literal.deinit(allocator);
+        literal.append(allocator, '"') catch return error.ScriptThrew;
+        for (input) |byte| {
+            switch (byte) {
+                '"' => literal.appendSlice(allocator, "\\\"") catch return error.ScriptThrew,
+                '\\' => literal.appendSlice(allocator, "\\\\") catch return error.ScriptThrew,
+                '\n' => literal.appendSlice(allocator, "\\n") catch return error.ScriptThrew,
+                '\r' => literal.appendSlice(allocator, "\\r") catch return error.ScriptThrew,
+                '\t' => literal.appendSlice(allocator, "\\t") catch return error.ScriptThrew,
+                0...8, 11, 12, 14...31 => {
+                    var escaped: [6]u8 = undefined;
+                    const text = std.fmt.bufPrint(&escaped, "\\u{x:0>4}", .{byte}) catch return error.ScriptThrew;
+                    literal.appendSlice(allocator, text) catch return error.ScriptThrew;
+                },
+                else => literal.append(allocator, byte) catch return error.ScriptThrew,
+            }
+        }
+        literal.append(allocator, ')') catch return error.ScriptThrew;
+
+        var call = std.ArrayList(u8).empty;
+        defer call.deinit(allocator);
+        call.appendSlice(allocator, name) catch return error.ScriptThrew;
+        call.append(allocator, '(') catch return error.ScriptThrew;
+        call.appendSlice(allocator, literal.items[0 .. literal.items.len - 1]) catch return error.ScriptThrew;
+        call.appendSlice(allocator, "))") catch return error.ScriptThrew;
+
+        // The engine parses its input as a C string, so the call is terminated before it is evaluated.
+        call.append(allocator, 0) catch return error.ScriptThrew;
+        const terminated: [:0]u8 = call.items[0 .. call.items.len - 1 :0];
+
+        const result = self.context.eval(terminated, "<zeex>", .{});
+        defer result.deinit(self.context);
+
+        if (result.isException()) {
+            self.recordThrow();
+
+            return error.ScriptThrew;
+        }
+
+        const text = result.toCString(self.context) orelse return error.ScriptThrew;
+        defer self.context.freeCString(text);
+
+        return allocator.dupe(u8, std.mem.span(text)) catch error.ScriptThrew;
+    }
+
     /// Call a script function with one integer, and read one integer back.
     ///
     /// Deliberately small: a call is built as `name(argument)` and evaluated. Typed arguments will come

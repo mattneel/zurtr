@@ -56,6 +56,46 @@ This is also the seam distribution hangs off: the bus already carries "this happ
 session and an agent on one worker, and putting `data`'s tiers underneath it is what carries the same
 statement between machines.
 
+## A view is a component, in Zig or in JavaScript
+
+A view is the component contract below, and its parts may come from either language:
+
+| Part | Zig | JavaScript (QuickJS) |
+| :- | :- | :- |
+| `render` | a ZEEX template (JSX, lowered at build time) | a template too — the template is data, not code |
+| `init`, `handleEvent`, `handleInfo`, `terminate` | plain functions | functions in a loaded script revision |
+
+The correspondence is deliberate: a `TasksPage` is one declaration, and where its handlers live is a
+deployment choice rather than an architecture. A Zig view is compiled and typed end to end. A scripted
+view is loaded as a revision (`zurtr.script`) and its handlers call the same host functions a Zig handler
+would — authorization, validation and transactions included — so a reload changes behaviour without
+changing authority. See `docs/modules/script.md` for what a script can reach, and `agents.md` for the
+same rule applied to durable workflows.
+
+What is *not* on the table is a second renderer: both languages produce the same `tree.Tree`, and the
+patcher does not know which one made it.
+
+### Interaction is the wire protocol, not a framework
+
+Reactivity is server-driven, exactly as §"Live protocol" describes: an event goes up with a client id, the
+server runs the handler, re-renders, diffs and sends patches addressed by node id. There is no client-side
+state machine to keep in sync, because the client has no state to keep — which is the property that makes
+resync always correct (a full render is the same operation as a patch).
+
+### The client is a DOM bridge, and QuickJS stays on the server
+
+The browser runs a bundled, prebuilt bridge and nothing else. Shipping the engine to the client as well
+would mean two runtimes to keep in agreement about the same view, megabytes of payload, and a client that
+can drift from the server's idea of the page — for no capability the patch protocol does not already have.
+
+### Hooks, when they come
+
+An escape hatch for client-owned behaviour is already expressible: `raw` nodes are client-owned DOM
+regions the server never patches into. A hook is therefore a `raw` region with a mount callback registered
+against its `data-z` id — client-side code that owns its subtree, exactly where the server has promised
+not to write. Nothing in the tree, the patcher or the protocol has to change for it, which is why it can
+be deferred without costing anything later.
+
 ## Render representation
 
 A single representation serves initial HTML and later patches (see

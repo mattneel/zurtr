@@ -35,6 +35,12 @@ pub const live = struct {
 /// for the engine never pays for one.
 pub const script = @import("script/root.zig");
 
+/// ZEEX: JSX templates lowered to Zig at build time, by a script the vendored engine runs.
+///
+/// The compiler needs the script engine, so it is reachable only in builds that have one; the generated
+/// code needs nothing but this framework.
+pub const zeex = if (@import("build_options").script) @import("zeex/compile.zig") else struct {};
+
 /// Data: queries, transactions, migrations, adapters.
 ///
 /// The adapter itself is `data.turso`, which needs the vendored binding; the contract types here
@@ -82,4 +88,5 @@ test {
     _ = live.protocol;
     _ = live.pubsub;
     _ = data;
+    if (comptime @import("build_options").script) _ = zeex;
 }
