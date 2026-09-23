@@ -37,7 +37,7 @@ this tree has the contract and no implementation; a module moves to
 *implemented* when its first real surface lands.
 
 Optional layers: `zscript` (QuickJS-ng, `docs/modules/zscript.md`) and `zeex`
-(JSX lowered to Zig at build time by a script the build runs, `src/zeex/`) sit
+(JSX lowered to Zig at build time by a script the build runs, `src/zeex/`, `docs/modules/zeex.md`) sit
 beside the modules rather than in the dependency order — nothing below them
 depends on them, and everything above them can. `zscript` is behavior a host can
 replace without a native rebuild, and the authority a script can reach is exactly

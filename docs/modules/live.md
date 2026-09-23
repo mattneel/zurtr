@@ -72,7 +72,7 @@ A view is the component contract below, and its parts may come from either langu
 
 | Part | Zig | JavaScript (QuickJS) |
 | :- | :- | :- |
-| `render` | a ZEEX template (JSX, lowered at build time) | a template too — the template is data, not code |
+| `render` | a ZEEX template (JSX, lowered at build time, `docs/modules/zeex.md`) | a template too — the template is data, not code |
 | `init`, `handleEvent`, `handleInfo`, `terminate` | plain functions | functions in a loaded script revision |
 
 The correspondence is deliberate: a `TasksPage` is one declaration, and where its handlers live is a
