@@ -36,6 +36,9 @@
         // nothing is fetched; its own native build (Turso compiled from Rust source) only runs when a
         // build actually reaches the adapter, which is why the base build stays dependency-free.
         .turso = .{ .path = "deps/turso" },
+        // The script engine, vendored at deps/quickjs-ng (see its UPSTREAM.md). Its QuickJS C sources
+        // are a package dependency of the binding, so nothing is fetched unless -Dscript asks for it.
+        .quickjs_ng = .{ .path = "deps/quickjs-ng" },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding

@@ -24,6 +24,12 @@ pub const live = struct {
     pub const protocol = @import("live/protocol.zig");
 };
 
+/// Script: the QuickJS seam. Behavior the host can replace without a native rebuild.
+///
+/// The engine is behind `-Dscript`; the seam's own types do not need it, so a build that never asks
+/// for the engine never pays for one.
+pub const script = @import("script/root.zig");
+
 /// Data: queries, transactions, migrations, adapters.
 ///
 /// The adapter itself is `data.turso`, which needs the vendored binding; the contract types here

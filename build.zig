@@ -78,10 +78,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // --- quickjs (vendored, opt-in) -----------------------------------------
+    // The script engine compiles QuickJS-ng's C through Zig and needs the LLVM backend, so the base
+    // build must not ask for it. Same pattern as the adapter: the import name always resolves, and what
+    // it resolves to depends on whether this build asked for the engine.
+    const enable_script = b.option(bool, "script", "Build the QuickJS script layer (vendored zig-quickjs-ng)") orelse false;
+
+    const quickjs = if (enable_script) blk: {
+        const dep = b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize });
+
+        break :blk dep.module("quickjs");
+    } else b.createModule(.{
+        .root_source_file = b.path("src/script/quickjs_not_built.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // --- zurtr --------------------------------------------------------------
     const zurtr_options = b.addOptions();
     zurtr_options.addOption(bool, "turso", enable_turso);
     zurtr_options.addOption(bool, "turso_sync", turso_sync);
+    zurtr_options.addOption(bool, "script", enable_script);
 
     const zurtr = b.addModule("zurtr", .{
         .root_source_file = b.path("src/root.zig"),
@@ -90,6 +107,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zix", .module = zix },
             .{ .name = "turso", .module = turso },
+            .{ .name = "quickjs", .module = quickjs },
         },
     });
     zurtr.addOptions("build_options", zurtr_options);
@@ -108,6 +126,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (enable_script) {
+        exe.use_llvm = true;
+        exe.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -152,8 +174,30 @@ pub fn build(b: *std.Build) void {
         data_test_run = run_data_tests;
     }
 
+    var script_test_run: ?*std.Build.Step.Run = null;
+    if (enable_script) {
+        const script_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/script/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "quickjs", .module = quickjs }},
+            }),
+        });
+        script_tests.root_module.addOptions("build_options", zurtr_options);
+        // Zig fails with splitType errors on the QuickJS translation unit without LLVM.
+        script_tests.use_llvm = true;
+        script_tests.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
+
+        const run_script_tests = b.addRunArtifact(script_tests);
+        const test_script_step = b.step("test-script", "Run the script layer's tests against QuickJS");
+        test_script_step.dependOn(&run_script_tests.step);
+        script_test_run = run_script_tests;
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zurtr_tests.step);
     test_step.dependOn(&run_zix_tests.step);
     if (data_test_run) |run| test_step.dependOn(&run.step);
+    if (script_test_run) |run| test_step.dependOn(&run.step);
 }

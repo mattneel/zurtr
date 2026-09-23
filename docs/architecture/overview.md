@@ -26,6 +26,11 @@ Applications are ordinary Zig and deploy as one static executable.
 | `app` | Config, routes, middleware, auth, lifecycle, telemetry; wires the rest | all of the above |
 | `dev` | Incremental builds, reload, diagnostics, tests, inspection | build system; not linked into release apps |
 
+Optional layer: `script` (QuickJS-ng, `docs/modules/script.md`) sits beside the modules rather than in
+the dependency order — nothing below it depends on it, and everything above it can. Behavior a host can
+replace without a native rebuild; the authority a script can reach is exactly the host functions the host
+registered.
+
 Dependency rule: arrows point downward only. `live` core never imports `domain`;
 the *glue* that binds live events to domain actions lives in `app` (a small
 `actions` bridge), so Live UI remains usable without Domain and Domain without
