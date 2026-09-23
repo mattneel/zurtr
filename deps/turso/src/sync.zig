@@ -4,6 +4,14 @@
 //! HTTP/filesystem transports remain separate policy layers. Remote cipher
 //! selection and unfinished native transform callbacks are not safe APIs.
 
+/// The base binding this module is built from.
+///
+/// A build that has the sync SDK has no separate `turso` module to import: this module is rooted in
+/// the same source tree, and Zig refuses to put one file in two modules of one compilation — the two
+/// copies would not even be the same type. A consumer that needs both halves (a database that may or
+/// may not be synced, say) reaches the base surface here instead.
+pub const base = @import("turso.zig");
+
 pub const raw = @import("sync/raw.zig");
 pub const version = @import("version.zig");
 const config_mod = @import("sync/config.zig");

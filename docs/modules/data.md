@@ -109,14 +109,53 @@ The tier is the whole of an adapter's durability and reach, and it is chosen at 
 | `.sync` | a local file plus a remote database | the machine | every node syncing that remote |
 | `.distributed` | a local file per node, one logical database | the machine | many nodes, one writer |
 
-Tiers 1 and 2 are complete and tested. `.sync` is **refused** with `error.Unavailable`: the remote half
-needs a transport that is not wired yet, and opening the local file instead would leave a caller that
-asked for synchronization with a database that never synchronizes. `-Dturso-sync` builds the sync SDK
-Kit; nothing calls it yet, which is exactly why the tier still refuses.
+Tiers 1 and 2 are complete and tested. `.sync` opens in a build that has the sync SDK Kit
+(`-Dturso-sync=true`, which builds a second native library): the local file is opened and serves SQL
+immediately, and the remote half is the caller's to drive — `Engine.push`, `pull`, `syncPass` and
+`stats`, one operation per call, no threads and no timers, which is what the binding requires.
+`-Dturso-sync=false` has no `turso_sync` module at all, so the tier is refused with `error.Unavailable`
+rather than opened as a local file that would never synchronize. A `.sync` path must also be relative
+to the working directory: the engine hands its own file requests (metadata, changes log, WAL) to the
+transport as paths derived from the database's, and the transport resolves them under the working
+directory and refuses absolute ones — an absolute path is refused with `error.Operation`.
 
 `.distributed` opens, because its enforceable half is local and real: reads from any node, writes only
-from the lease holder. What it still needs for a deployment across machines is the same transport
-`.sync` is waiting on — until then it is one machine's discipline, tested with two nodes over one file.
+from the lease holder. It also asks the engine for its experimental multiprocess WAL coordination,
+without which a second live process cannot open the file at all — that is what `test-data-nodes` exists
+to prove, with two real processes over one file.
+
+### The sync tier's remote
+
+What is proven, and how: two local databases, one remote, both directions. The test that does it needs
+a server, so it runs only when the build is told where one is:
+
+```sh
+# tursodb's sync server, from the pinned upstream checkout:
+#   cargo build --release --package turso_cli --bin tursodb
+#   tursodb --sync-server 127.0.0.1:8080 /tmp/tursodb-sync/server.db
+zig build test-data -Dturso=true -Dturso-sync=true -Dsync-remote=http://127.0.0.1:8080
+```
+
+It pushes from one database, bootstraps a second one from the remote and reads the first one's row
+there, then writes from the second and pulls that row into the first. It runs against a server on this
+machine or against the same URL tunnelled to another box (`fly proxy 18080:8080 -a <app>` — the
+endpoint stays loopback, which is what lets the plain-HTTP rule hold); the test does not care which,
+because it only knows the URL. Without `-Dsync-remote` the test skips and the rest of the suite still
+covers the tier: that it opens over a local file with no server at all, and that an operation against a
+remote that does not answer comes back as `error.Unavailable` — mapped, not a panic and not a silent
+success.
+
+What still needs a live endpoint, and one with credentials: the `auth_token` path. The tier's token is
+sent as the `Authorization` header's value on every request the engine makes, but every server this has
+been run against (`tursodb --sync-server`) has no authentication at all, so that header is unproven —
+the tests above pass `auth_token = null`. TLS is likewise proven only as far as "an https URL is
+accepted by the transport and dialled by it"; the round trips above are plain HTTP to a loopback host,
+which is the only scheme the transport allows without TLS.
+
+What is deliberately *not* here: scheduling, retry and conflict policy. `pull` is one operation, not a
+loop; a `Busy`/`Conflict` outcome is the caller's to retry, and nothing runs in the background. Remote
+state also arrives on demand rather than at open: a fresh local file is opened without the network (the
+engine's deferred bootstrap) and meets the remote on its first `pull`/`syncPass`.
 
 ### The write lease
 
@@ -151,8 +190,17 @@ someone else's lease.
   tests never require a database.
 - Turso: `zig build test-data -Dturso=true` runs the tier tests — every value tag round-tripping,
   a unique violation mapping to `conflict`, commit and rollback semantics, reopen durability for the
-  file tier, and the write lease. It runs against the real native SDK Kit, and it is part of
-  `zig build test -Dturso=true`.
+  file tier, the write lease, and (with `-Dturso-sync=true`) the sync tier opening over a local file
+  and refusing to pretend when its remote does not answer. It runs against the real native SDK Kit, and
+  it is part of `zig build test -Dturso=true`.
+- Turso, across processes: `zig build test-data-nodes -Dturso=true` builds `src/data/node.zig` and runs
+  it twice, as two unrelated processes over one `.distributed` database file, asserting what each saw:
+  one writer at a time while the holder is alive, the follower's refusal, the takeover once the lease
+  expires, and both rows durable in the file afterwards. The pids are in the harness's output, so "two
+  processes" is checkable rather than assumed.
+- Turso, against a live sync endpoint: `zig build test-data -Dturso=true -Dturso-sync=true
+  -Dsync-remote=<url>` adds the round trip described under "The sync tier's remote"; without the flag
+  that one test skips.
 - Transaction semantics tests: commit persists, rollback discards, scope-exit
   rolls back, unique violation maps to `conflict`, pool exhaustion maps to
   `unavailable` and recovers.

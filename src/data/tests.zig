@@ -4,10 +4,29 @@
 //! remote: parameter and row round-trips, transaction semantics, error mapping, and the write lease
 //! that makes the distributed tier meaningful. The file tier is tested for the property that
 //! distinguishes it from memory — a reopened database still has the data.
+//!
+//! The sync tier's tests come in the two configurations the build can have. With `-Dturso-sync` the
+//! tier opens and talks to a remote, so what is tested here without one is that a remote that does not
+//! answer is a mapped framework error rather than a panic or a silent success; the round trip that
+//! needs a live endpoint runs only when the build was told where one is (`-Dsync-remote=...`), and is
+//! skipped otherwise. Without the SDK the tier is refused, which is asserted where a reader would look
+//! for it. The cross-process evidence for the distributed tier is `test-data-nodes`, not this file.
 
 const std = @import("std");
 const data = @import("root.zig");
 const adapter = @import("turso_adapter.zig");
+const build_options = @import("build_options");
+
+/// A live sync endpoint, when the build was told about one (`-Dsync-remote=http://host:port`). The
+/// round trip needs a server that speaks the sync protocol; everything else about the tier is tested
+/// without one.
+const sync_remote: ?[]const u8 = build_options.sync_remote;
+
+/// The sync tier's own directory. The sync engine keeps a family of files beside the database
+/// (`<path>-info`, `<path>-changes`, `<path>-wal`, …), so a test that has to start clean cleans the
+/// directory rather than guessing at the family. The tests also *create* it first: like every other
+/// tier, the adapter opens a path, it does not invent the directories on the way to it.
+const sync_dir = "zig-cache-data-sync-test";
 
 /// Collects rows so assertions can run outside the sink callback.
 const Collector = struct {
@@ -230,17 +249,194 @@ test "only one node holds the write lease, and it expires" {
     try std.testing.expect((try engine.leaseHolder(adapter.default_lease)) == null);
 }
 
-test "a tier whose remote transport is not wired refuses instead of pretending" {
+/// The remote the offline sync tests point at: a loopback port with nothing behind it, so the
+/// connection is refused rather than being refused by policy (a non-loopback `http://` endpoint would
+/// be turned away by the transport before it was dialled, which is a different test).
+const dead_remote = "http://127.0.0.1:1";
+
+test "a sync tier needs the SDK Kit: refused without it, opened with it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The sync tier's remote half needs a transport that does not exist yet, so the tier is refused
-    // whether or not the SDK Kit is built: opening the local file instead would hand a caller that
-    // asked for synchronization a database that never synchronizes, which is worse than an error.
-    try std.testing.expectError(error.Unavailable, adapter.open(arena, std.testing.io, .{
-        .sync = .{ .path = ":memory:", .remote = "https://example.invalid" },
-    }));
+    defer deleteTree(std.testing.io, sync_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sync_dir);
+
+    const path = sync_dir ++ "/app.db";
+    const tier = data.Tier{ .sync = .{ .path = path, .remote = dead_remote } };
+
+    if (comptime !build_options.turso_sync) {
+        // Without the SDK there is no remote half to open, and opening the local file instead would
+        // hand a caller that asked for synchronization a database that never synchronizes. So the tier
+        // is refused — in every build that did not ask for the SDK.
+        try std.testing.expectError(error.Unavailable, adapter.open(arena, std.testing.io, tier));
+
+        return;
+    }
+
+    // With the SDK the tier is a local file plus a remote, and the local half does not wait for the
+    // remote: this opens with a remote that nothing is listening on, and serves SQL at that path. The
+    // remote's state arrives on the first pull, which is the next test's subject.
+    var db = try adapter.open(arena, std.testing.io, tier);
+    defer db.close();
+
+    try schema(&db);
+    _ = try db.exec(null, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = 1 }, .{ .text = "local only, so far" }, .{ .integer = 3 },
+    });
+
+    var collector = Collector.init(arena);
+    try db.query(null, "SELECT title FROM notes", &.{}, collector.sink());
+    try std.testing.expectEqual(@as(usize, 1), collector.rows.items.len);
+    try std.testing.expectEqualStrings("local only, so far", collector.rows.items[0][0].text);
+
+    // The sync surface belongs to the same engine, and this is the file the tier promised.
+    try std.testing.expect(adapter.engine(&db) == adapter.engine(&db));
+    try std.testing.expect(fileExists(std.testing.io, path));
+}
+
+test "an operation against a remote that does not answer is a mapped error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer deleteTree(std.testing.io, sync_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sync_dir);
+
+    const tier = data.Tier{ .sync = .{ .path = sync_dir ++ "/unreachable.db", .remote = dead_remote } };
+
+    if (comptime !build_options.turso_sync) {
+        // Same assertion, same reason: with no SDK there is no operation to attempt.
+        try std.testing.expectError(error.Unavailable, adapter.open(arena, std.testing.io, tier));
+
+        return;
+    }
+
+    var db = try adapter.open(arena, std.testing.io, tier);
+    defer db.close();
+    try schema(&db);
+
+    const engine = adapter.engine(&db);
+
+    // Nothing is listening on that port, so every operation that has to cross to the remote comes back
+    // as `unavailable` — the taxonomy's word for "the dependency is down, retry by policy" — rather
+    // than a panic, a silent success, or a database that pretends it synchronized.
+    try std.testing.expectError(error.Unavailable, engine.push());
+    try std.testing.expectError(error.Unavailable, engine.pull());
+    try std.testing.expectError(error.Unavailable, engine.syncPass());
+
+    // The local half is still a database: a failed push does not take the SQL surface with it, and the
+    // write that was waiting stays local.
+    _ = try db.exec(null, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = 1 }, .{ .text = "still local" }, .{ .integer = 2 },
+    });
+
+    var collector = Collector.init(arena);
+    try db.query(null, "SELECT title FROM notes", &.{}, collector.sink());
+    try std.testing.expectEqual(@as(usize, 1), collector.rows.items.len);
+}
+
+test "a sync tier round-trips through a live endpoint" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Needs a server: run with `-Dsync-remote=http://127.0.0.1:8080` against a local `tursodb
+    // --sync-server`, or against the same URL tunnelled to a remote box. Without one there is nothing
+    // to round-trip through, and the test says so rather than pretending.
+    const remote = sync_remote orelse return error.SkipZigTest;
+
+    defer deleteTree(std.testing.io, sync_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, sync_dir);
+
+    // The remote is a database that outlives this test and may already have rows in it from an earlier
+    // run, so nothing here may assume an empty one: the rows carry this run's own keys and titles, and
+    // the assertions look for those rather than for a shape the last run left behind.
+    const stamp = std.Io.Clock.Timestamp.now(std.testing.io, .real).raw.toMicroseconds();
+    var first_title_buffer: [64]u8 = undefined;
+    var second_title_buffer: [64]u8 = undefined;
+    const first_title = try std.fmt.bufPrint(&first_title_buffer, "from the first node {d}", .{stamp});
+    const second_title = try std.fmt.bufPrint(&second_title_buffer, "from the second node {d}", .{stamp});
+
+    // --- one node: opens, writes, pushes --------------------------------------------------------
+    var one = try adapter.open(arena, std.testing.io, .{ .sync = .{ .path = sync_dir ++ "/one.db", .remote = remote } });
+    defer one.close();
+
+    try schema(&one);
+    _ = try one.exec(null, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = stamp }, .{ .text = first_title }, .{ .integer = 4 },
+    });
+
+    try adapter.engine(&one).push();
+
+    // The numbers the operation reports are the push's own evidence: it reached a server (a push
+    // timestamp) and it sent something (bytes). The revision stays as the engine reports it — it is
+    // empty on a database that has nothing to be in step with yet, which is a fact about the engine
+    // and not something this test should pin.
+    var stats = try adapter.engine(&one).stats();
+    defer stats.deinit();
+    try std.testing.expect(stats.last_push_unix_time > 0);
+    try std.testing.expect(stats.network_sent_bytes > 0);
+
+    // A pull straight after a push is the engine's business to report — the remote may hand back the
+    // base revision, or nothing. What the binding does promise together is that a pull that received
+    // changes applied them, so that is the assertion.
+    const after_push = try adapter.engine(&one).pull();
+    if (after_push.changes_received) try std.testing.expect(after_push.changes_applied);
+
+    // --- a second node: a fresh local file, the same remote --------------------------------------
+    // This is the tier's whole claim: the database survives its machine because the remote has it. The
+    // second node has never seen the first one's file, and its own file is empty until it meets the
+    // remote — the engine's deferred bootstrap, which is the pull inside this first pass.
+    var two = try adapter.open(arena, std.testing.io, .{ .sync = .{ .path = sync_dir ++ "/two.db", .remote = remote } });
+    defer two.close();
+
+    const bootstrapped = try adapter.engine(&two).syncPass();
+    try std.testing.expect(bootstrapped.push_completed);
+
+    var remote_rows = Collector.init(arena);
+    try two.query(null, "SELECT id, title FROM notes", &.{}, remote_rows.sink());
+    try std.testing.expect(titlesContain(remote_rows.rows.items, first_title));
+
+    // And back the other way: the second node writes, and the first sees it after a pull. Two local
+    // files, two directions, one remote — which is the tier, end to end.
+    _ = try two.exec(null, "INSERT INTO notes (id, title, word_count) VALUES (?1, ?2, ?3)", &.{
+        .{ .integer = stamp + 1 }, .{ .text = second_title }, .{ .integer = 5 },
+    });
+
+    const pass = try adapter.engine(&two).syncPass();
+    try std.testing.expect(pass.push_completed);
+
+    const pulled = try adapter.engine(&one).pull();
+    try std.testing.expect(pulled.changes_received);
+    try std.testing.expect(pulled.changes_applied);
+
+    var both = Collector.init(arena);
+    try one.query(null, "SELECT id, title FROM notes", &.{}, both.sink());
+    try std.testing.expect(titlesContain(both.rows.items, first_title));
+    try std.testing.expect(titlesContain(both.rows.items, second_title));
+}
+
+/// Whether the rows a read returned include a title. The remote is shared and persistent, so the
+/// questions these tests ask are about *these* rows, never about the whole table's shape.
+fn titlesContain(rows: []const []data.Value, title: []const u8) bool {
+    for (rows) |row| {
+        if (std.mem.eql(u8, row[1].text, title)) return true;
+    }
+
+    return false;
+}
+
+fn fileExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+
+    return true;
+}
+
+/// Remove a test's directory and everything in it. The sync engine's files are derived from the
+/// database's path, so a directory per test is the only cleanup that cannot miss one.
+fn deleteTree(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
 }
 
 test "a distributed tier writes only while it holds the lease" {
@@ -249,7 +445,9 @@ test "a distributed tier writes only while it holds the lease" {
     const arena = arena_state.allocator();
 
     const path = "zig-cache-data-distributed-test.db";
-    const siblings = [_][]const u8{ path, path ++ "-wal", path ++ "-shm" };
+    // `-tshm` is the shared WAL coordination file the engine's multiprocess mode adds — this tier
+    // asks for that mode, so its sidecars are this test's to clean up too.
+    const siblings = [_][]const u8{ path, path ++ "-wal", path ++ "-shm", path ++ "-tshm" };
     for (siblings) |file| std.Io.Dir.cwd().deleteFile(std.testing.io, file) catch {};
     defer for (siblings) |file| std.Io.Dir.cwd().deleteFile(std.testing.io, file) catch {};
 

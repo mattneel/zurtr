@@ -57,11 +57,24 @@ pub fn build(b: *std.Build) void {
     // uses it is dead), but nothing links the native library until something actually reaches the
     // adapter — and only `-Dturso` builds are meant to.
     const enable_turso = b.option(bool, "turso", "Build the Turso data adapter (compiles the native SDK from Rust source)") orelse false;
-    const turso_sync = b.option(bool, "turso-sync", "Include the opt-in Turso sync SDK Kit (implies -Dturso)") orelse false;
+    // `-Dturso-sync` implies `-Dturso`: there is no adapter to give a remote half to otherwise, and the
+    // package only offers the sync module when it was asked to build the adapter at all.
+    const turso_sync = enable_turso and (b.option(bool, "turso-sync", "Include the opt-in Turso sync SDK Kit (implies -Dturso)") orelse false);
+    // The sync tier's round trip needs a server, so the only test that talks to a remote is told where
+    // it is. Passing it through the build (rather than the environment) is what makes the test run
+    // reproducible: the value is part of the step's cache key, so a new endpoint really does re-run it.
+    const sync_remote = b.option([]const u8, "sync-remote", "Live sync endpoint for the sync tier's round-trip test, e.g. http://127.0.0.1:8080");
 
     // Asking the package for its module is what asks for its native artifact, so a build that does not
     // build the adapter must not ask: without `-Dturso` the import resolves to a guard file that says
     // so, and cargo is never invoked.
+    //
+    // The sync module is a second artifact with its own gate: the package only creates `turso_sync` in
+    // a build that asked for it, so `-Dturso-sync=false` leaves the name with nothing to resolve and
+    // the adapter's `.sync` tier refuses. That is the intended shape, not an omission: the tier is
+    // either backed by the SDK Kit or refused, never quietly local-only.
+    var turso_sync_module: ?*std.Build.Module = null;
+
     const turso = if (enable_turso) blk: {
         const turso_dep = b.dependency("turso", .{
             .target = target,
@@ -70,6 +83,8 @@ pub fn build(b: *std.Build) void {
             .linkage = "static",
             .sync = turso_sync,
         });
+
+        if (turso_sync) turso_sync_module = turso_dep.module("turso_sync");
 
         break :blk turso_dep.module("turso");
     } else b.createModule(.{
@@ -100,15 +115,23 @@ pub fn build(b: *std.Build) void {
     zurtr_options.addOption(bool, "turso_sync", turso_sync);
     zurtr_options.addOption(bool, "script", enable_script);
 
+    var zurtr_imports: std.ArrayList(std.Build.Module.Import) = .empty;
+    zurtr_imports.append(b.allocator, .{ .name = "zix", .module = zix }) catch @panic("OOM");
+    zurtr_imports.append(b.allocator, .{ .name = "quickjs", .module = quickjs }) catch @panic("OOM");
+    if (turso_sync_module) |module| {
+        // A sync build has one module for the whole stack: the SDK module is rooted in the same source
+        // tree and re-exports the base binding as `base`. Zig will not put one file in two modules of
+        // one compilation — and two copies of `Connection` would not be the same type anyway.
+        zurtr_imports.append(b.allocator, .{ .name = "turso_sync", .module = module }) catch @panic("OOM");
+    } else {
+        zurtr_imports.append(b.allocator, .{ .name = "turso", .module = turso }) catch @panic("OOM");
+    }
+
     const zurtr = b.addModule("zurtr", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zix", .module = zix },
-            .{ .name = "turso", .module = turso },
-            .{ .name = "quickjs", .module = quickjs },
-        },
+        .imports = zurtr_imports.items,
     });
     zurtr.addOptions("build_options", zurtr_options);
 
@@ -156,22 +179,77 @@ pub fn build(b: *std.Build) void {
     // The data module's tests need a real database, so they are wired only when the adapter is built.
     var data_test_run: ?*std.Build.Step.Run = null;
     if (enable_turso) {
+        var data_test_imports: std.ArrayList(std.Build.Module.Import) = .empty;
+        if (turso_sync_module) |module| {
+            data_test_imports.append(b.allocator, .{ .name = "turso_sync", .module = module }) catch @panic("OOM");
+        } else {
+            data_test_imports.append(b.allocator, .{ .name = "turso", .module = turso }) catch @panic("OOM");
+        }
+
         const data_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/data/tests.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "turso", .module = turso },
-                },
+                .imports = data_test_imports.items,
             }),
         });
-        data_tests.root_module.addOptions("build_options", zurtr_options);
+        const data_options = b.addOptions();
+        data_options.addOption(bool, "turso_sync", turso_sync);
+        data_options.addOption(?[]const u8, "sync_remote", sync_remote);
+        data_tests.root_module.addOptions("build_options", data_options);
         // The adapter opens a file tier in a place it can clean up, so point the test at the cache.
         const run_data_tests = b.addRunArtifact(data_tests);
         const test_data_step = b.step("test-data", "Run the data module's tests against Turso");
         test_data_step.dependOn(&run_data_tests.step);
         data_test_run = run_data_tests;
+    }
+
+    // The distributed tier's cross-process proof. A single test binary shares one allocator, one
+    // thread and one process lifetime, so it can prove the write lease's arithmetic and not its
+    // coordination; the harness is a real program, and the test runs it twice as two processes over
+    // one database file. It is built only with the adapter, and `test-data-nodes` is the only step
+    // that needs it.
+    var nodes_test_run: ?*std.Build.Step.Run = null;
+    if (enable_turso) {
+        const data_node = b.addExecutable(.{
+            .name = "zurtr-data-node",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/data/node.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{if (turso_sync_module) |module|
+                    .{ .name = "turso_sync", .module = module }
+                else
+                    .{ .name = "turso", .module = turso }},
+            }),
+        });
+        data_node.root_module.addOptions("build_options", zurtr_options);
+        b.installArtifact(data_node);
+
+        const nodes_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/data/nodes_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{if (turso_sync_module) |module|
+                    .{ .name = "turso_sync", .module = module }
+                else
+                    .{ .name = "turso", .module = turso }},
+            }),
+        });
+        // The test spawns the harness, so it needs its path — and, through the option, a build edge
+        // that guarantees the harness exists first. It also compiles the adapter (through the data
+        // module), so its options carry the adapter's own gate as well.
+        const nodes_options = b.addOptions();
+        nodes_options.addOptionPath("data_node_exe", data_node.getEmittedBin());
+        nodes_options.addOption(bool, "turso_sync", turso_sync);
+        nodes_tests.root_module.addOptions("build_options", nodes_options);
+
+        const run_nodes_tests = b.addRunArtifact(nodes_tests);
+        const test_nodes_step = b.step("test-data-nodes", "Run the distributed tier's two-process proof");
+        test_nodes_step.dependOn(&run_nodes_tests.step);
+        nodes_test_run = run_nodes_tests;
     }
 
     var script_test_run: ?*std.Build.Step.Run = null;
@@ -199,5 +277,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_zurtr_tests.step);
     test_step.dependOn(&run_zix_tests.step);
     if (data_test_run) |run| test_step.dependOn(&run.step);
+    if (nodes_test_run) |run| test_step.dependOn(&run.step);
     if (script_test_run) |run| test_step.dependOn(&run.step);
 }

@@ -19,6 +19,11 @@
 //! database always works locally first, and the remote is what carries changes further. That ordering is
 //! the point — a node that cannot reach its remote keeps serving and keeps its own state, which is what
 //! makes the deployment model (one static executable, many nodes) survivable.
+//!
+//! What that costs each of them is written where it is enforced (`turso_adapter.zig`, and the tier's own
+//! fields below): `.sync` needs the sync SDK Kit — a build with `-Dturso-sync`, otherwise the tier is
+//! refused — and a path relative to the working directory; `.distributed` needs the engine's
+//! experimental multiprocess WAL coordination before two live processes can open one file at all.
 
 const std = @import("std");
 
@@ -89,11 +94,17 @@ pub const Tier = union(enum) {
     distributed: Distributed,
 
     pub const Sync = struct {
-        /// The local file. The database is always usable at this path, remote or not.
+        /// The local file. The database is always usable at this path, remote or not — and it must be
+        /// relative to the working directory: the sync engine's own file requests (metadata, changes
+        /// log, WAL) are resolved under it and absolute paths are refused.
         path: []const u8,
-        /// The remote endpoint, as the sync transport expects it.
+        /// The remote endpoint, as the sync transport expects it: a base URL with no path of its own,
+        /// `http` only for a loopback host (anything else must be `https`).
         remote: []const u8,
-        /// The token the remote authenticates, when it wants one.
+        /// The value of the `Authorization` header sent to the remote, when it wants one — the token
+        /// itself with whatever scheme it uses (`Bearer <token>` for services that ask for that). It is
+        /// unproven against a remote that checks it: every endpoint this tier has been run against so
+        /// far takes no credentials at all.
         auth_token: ?[]const u8 = null,
     };
 
