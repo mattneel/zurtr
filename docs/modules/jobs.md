@@ -3,9 +3,12 @@
 Scope: durable queues, schedules, retries, concurrency, cancellation. Delivery
 is at-least-once; idempotency is the caller's contract (`contracts.md` §5).
 
-Status: **declared** — read the status from `src/root.zig`'s `modules` table, which is
-the inventory of record (`zurtr modules` prints it); this document is the contract the
-module is held to, and the sections below are its design.
+Status: **implemented** (`src/jobs/`, exposed as `zurtr.jobs`) — and read the status from
+`src/root.zig`'s `modules` table, which is the inventory of record (`zurtr modules` prints
+it); this document is the contract the module is held to, and the sections below are its
+design. The dialect substitutions the implementation makes are tabulated at the top of
+`src/jobs/schema.zig`, and each is asserted against the real engine by a named test in
+`src/jobs/tests.zig` rather than assumed.
 
 The model below is written in the dialect of the adapter that exists:
 Turso, which is SQLite-compatible (`src/data/turso_adapter.zig`), with four
