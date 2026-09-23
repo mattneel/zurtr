@@ -22,9 +22,9 @@
 //
 // Interpolation is a *path*, never an expression, so the generated Zig reads a field of the props struct
 // and a typo becomes a Zig compile error rather than a blank spot on a page. Text is escaped; `__raw` is
-// the one way to say otherwise. A capitalised tag is a component call and takes no children (that
-// convention is not decided yet, so children are refused rather than dropped); a loop variable may not
-// be `b`, `props` or `zurtr`, nor a name an enclosing loop already bound.
+// the one way to say otherwise. A capitalised tag is a component call, and its children become a slot
+// the component calls to render them (see docs/modules/zeex.md); a loop variable may not be a name the
+// generated code binds, nor a name an enclosing loop already bound.
 
 function fail(message, line) {
   throw new Error("zeex: " + message + (line ? " (line " + line + ")" : ""));
@@ -39,14 +39,11 @@ var VOID_TAGS = {
 // into the generated Zig, so anything else would become code in the output.
 var SEGMENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-// Names the generated code binds itself. A loop variable using one of these would shadow the Builder
-// (`b`) or the props struct (`props`) or the framework import (`zurtr`) inside the generated function.
-var RESERVED_VARS = { b: 1, props: 1, zurtr: 1 };
-
-// A capitalised tag is a component call — the same spelling convention the emitter uses (`std.ascii.isUpper`).
-function isComponentTag(tag) {
-  return tag.length > 0 && tag[0] >= "A" && tag[0] <= "Z";
-}
+// Names the generated code binds itself: the Builder (`b`), the props value (`props`), the framework
+// import (`zurtr`), a slot's receiver (`self`) and its `render` method. A loop variable using one of
+// these, or one of the generated type names below, would shadow something the generated code needs.
+var RESERVED_VARS = { b: 1, props: 1, zurtr: 1, self: 1, render: 1 };
+var RESERVED_PATTERN = /^(slot_b[0-9]*|Slot[0-9]*)$/;
 
 // Children that are more than markup whitespace: text with something in it, or any node.
 function hasContent(children) {
@@ -261,23 +258,19 @@ Parser.prototype.parseElement = function () {
     attrs.push({ name: name, value: { kind: "toggle" } });
   }
 
-  var component = isComponentTag(tag);
-
   if (selfClosing || VOID_TAGS[tag] === 1) {
     return { op: "element", tag: tag, attrs: attrs, children: [] };
   }
 
   var children = this.parseChildren(tag);
 
-  // A capitalised tag is a component call, and the emitter has nowhere to put children: passing them
-  // is a convention that has not been decided, so real content is refused here — where the line
-  // number is — rather than dropped in the generated code. Whitespace-only children are markup
-  // formatting, not content, and are normalized away below.
-  if (component && hasContent(children)) {
-    fail("<" + tag + "> is a component and cannot have children: the emitter has nowhere to put them", lineAt(this.source, start));
-  }
+  // The children of a capitalised tag become that component's slot, so they are kept as they are. The
+  // one normalization: whitespace-only children are markup formatting rather than content, and are
+  // dropped so `<Card>\n</Card>` passes no slot at all (the component sees "no children", like a
+  // LiveView component seeing no `inner_block`).
+  if (hasContent(children) === false) children = [];
 
-  return { op: "element", tag: tag, attrs: attrs, children: component ? [] : children };
+  return { op: "element", tag: tag, attrs: attrs, children: children };
 };
 
 Parser.prototype.parseBraced = function () {
@@ -328,7 +321,7 @@ Parser.prototype.parseBraced = function () {
 
     // The name is interpolated into `for (…) |name|` verbatim, so a reserved or already-bound one
     // would shadow something the generated function needs.
-    if (RESERVED_VARS[item] === 1) {
+    if (RESERVED_VARS[item] === 1 || RESERVED_PATTERN.test(item)) {
       fail("`" + item + "` is a name the generated code binds; pick another loop variable", lineAt(this.source, start));
     }
     if (this.loopVars[item] === 1) {

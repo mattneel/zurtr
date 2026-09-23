@@ -77,7 +77,11 @@ fn generate(allocator: std.mem.Allocator, ir_json: []const u8) Error![:0]u8 {
         \\pub fn render(props: anytype, b: *zurtr.live.tree.Builder) !void {
         \\
     ) catch return error.OutOfMemory;
-    emitNodes(w, root.array.items, 1) catch return error.OutOfMemory;
+    var slots: u32 = 0;
+    emitNodes(w, root.array.items, 1, .{}, &slots) catch |err| switch (err) {
+        error.MalformedIr => return error.MalformedIr,
+        else => return error.OutOfMemory,
+    };
     w.writeAll("}\n") catch return error.OutOfMemory;
 
     // A source file in Zig terms is sentinel-terminated: `std.zig.Ast.parse` takes it that way, and so
@@ -101,11 +105,33 @@ fn indent(w: anytype, depth: usize) std.Io.Writer.Error!void {
 /// infer an error set through a cycle.
 const EmitError = std.Io.Writer.Error || error{MalformedIr};
 
-fn emitNodes(w: anytype, nodes: []const std.json.Value, depth: usize) EmitError!void {
-    for (nodes) |node| try emitNode(w, node, depth);
+/// What an emitted expression needs to know about the scope it lands in.
+///
+/// A slot body is a method on a generated struct, so the two things an expression can name — the builder
+/// and a value from the enclosing template — live in different places there than they do in `render`
+/// itself. A loop variable is the third case: bound by a `for` in this very function, it is the bare
+/// name, while one the slot carries is reached through `self`.
+const Scope = struct {
+    /// The builder in this scope: `b` in `render`, `slot_bN` inside a slot method.
+    b: []const u8 = "b",
+    /// How a carried value is reached: "" at the top level, "self." inside a slot method.
+    root: []const u8 = "",
+    /// Names a `for` in the current function binds; referenced as the bare name.
+    loops: []const []const u8 = &.{},
+    /// Names the enclosing slot carries; referenced as `{root}{name}`.
+    carried: []const []const u8 = &.{},
+};
+
+/// Deepest a template may nest `for`s and carried values. Matches the transform's own limits in spirit:
+/// a template is a small declaration, and a bound that fails loudly beats a stack this code walks.
+const max_loop_depth = 16;
+const max_carried = 16;
+
+fn emitNodes(w: anytype, nodes: []const std.json.Value, depth: usize, scope: Scope, slots: *u32) EmitError!void {
+    for (nodes) |node| try emitNode(w, node, depth, scope, slots);
 }
 
-fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
+fn emitNode(w: anytype, node: std.json.Value, depth: usize, scope: Scope, slots: *u32) EmitError!void {
     const object = node.object;
     const op = object.get("op") orelse return error.MalformedIr;
     const name = op.string;
@@ -113,15 +139,15 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
     if (std.mem.eql(u8, name, "text")) {
         const value = object.get("value").?.string;
         try indent(w, depth);
-        try w.print("try b.text(\"{f}\");\n", .{std.zig.fmtString(value)});
+        try w.print("try {s}.text(\"{f}\");\n", .{ scope.b, std.zig.fmtString(value) });
 
         return;
     }
 
     if (std.mem.eql(u8, name, "expr")) {
         try indent(w, depth);
-        try w.writeAll("try b.text(");
-        try pathText(w, object.get("path").?);
+        try w.print("try {s}.text(", .{scope.b});
+        try pathText(w, object.get("path").?, scope);
         try w.writeAll(");\n");
 
         return;
@@ -129,8 +155,8 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
 
     if (std.mem.eql(u8, name, "raw")) {
         try indent(w, depth);
-        try w.writeAll("try b.raw(");
-        try pathText(w, object.get("path").?);
+        try w.print("try {s}.raw(", .{scope.b});
+        try pathText(w, object.get("path").?, scope);
         try w.writeAll(");\n");
 
         return;
@@ -154,9 +180,9 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
 
         try indent(w, depth);
         try w.writeAll("if (");
-        try pathText(w, object.get("path").?);
+        try pathText(w, object.get("path").?, scope);
         try w.writeAll(") {\n");
-        try emitNodes(w, object.get("then").?.array.items, depth + 1);
+        try emitNodes(w, object.get("then").?.array.items, depth + 1, scope, slots);
         try indent(w, depth);
         try w.writeAll("}\n");
         return;
@@ -166,9 +192,18 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
         const item = object.get("item").?.string;
         try indent(w, depth);
         try w.writeAll("for (");
-        try pathText(w, object.get("path").?);
+        try pathText(w, object.get("path").?, scope);
         try w.print(") |{s}| {{\n", .{item});
-        try emitNodes(w, object.get("body").?.array.items, depth + 1);
+
+        // The body sees the loop variable: push it onto this scope's list.
+        var frame: [max_loop_depth][]const u8 = undefined;
+        if (scope.loops.len + 1 > frame.len) return error.MalformedIr;
+        @memcpy(frame[0..scope.loops.len], scope.loops);
+        frame[scope.loops.len] = item;
+        var inner = scope;
+        inner.loops = frame[0 .. scope.loops.len + 1];
+
+        try emitNodes(w, object.get("body").?.array.items, depth + 1, inner, slots);
         try indent(w, depth);
         try w.writeAll("}\n");
 
@@ -178,40 +213,56 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
     if (std.mem.eql(u8, name, "element")) {
         const tag = object.get("tag").?.string;
 
-        // A capitalised tag is a component call: the props struct carries the component, and the
-        // attributes become its argument struct — the JSX convention, lowered rather than interpreted.
+        // A capitalised tag is a component call. The props struct carries the component as a
+        // declaration, the attributes become its argument struct — the JSX convention, lowered rather
+        // than interpreted — and the children become a **slot**: a value whose `render` method builds
+        // them, which the component calls if and where it wants them (a LiveView component's
+        // `inner_block`). A tag with no children passes `null` for it.
         if (tag.len > 0 and std.ascii.isUpper(tag[0])) {
-            // A component takes no children (the convention for passing them is not decided), and the
-            // transform refuses them, so an IR that still carries some is not one this emitter knows:
-            // say so rather than dropping them.
-            const component_children = if (object.get("children")) |children| switch (children) {
-                .array => |items| items.items.len != 0,
-                else => true,
-            } else false;
-            if (component_children) {
-                std.debug.print("zeex: <{s}> is a component and the IR carries children; this emitter has nowhere to put them\n", .{tag});
+            const children: []const std.json.Value = if (object.get("children")) |value| switch (value) {
+                .array => |items| items.items,
+                else => return error.MalformedIr,
+            } else &.{};
 
-                return error.MalformedIr;
-            }
+            const index = slots.*;
+            slots.* += 1;
+
+            var carried_buf: [max_carried][]const u8 = undefined;
+            const carried = try carriedFor(children, scope, &carried_buf);
+            try emitSlot(w, children, carried, depth, scope, index, slots);
 
             try indent(w, depth);
-            try w.print("try props.{s}(.{{", .{tag});
+            // The call is a namespace call (`@TypeOf(props).Card`), not a method call: `props.Card(…)`
+            // would bind `props` as the component's receiver and pass one argument too many.
+            try w.print("try @TypeOf({s}props).{s}(.{{", .{ scope.root, tag });
+
+            var wrote: bool = false;
             if (object.get("attrs")) |attrs| {
-                for (attrs.array.items, 0..) |attr, index| {
+                for (attrs.array.items) |attr| {
                     const attr_name = attr.object.get("name").?.string;
                     const value = attr.object.get("value").?;
-                    if (index > 0) try w.writeAll(", ");
+                    if (wrote) try w.writeAll(", ");
                     try w.print(".{s} = ", .{attr_name});
-                    try emitAttrValue(w, value);
+                    try emitAttrValue(w, value, scope);
+                    wrote = true;
                 }
             }
-            try w.writeAll("}, b);\n");
+            if (wrote) try w.writeAll(", ");
+
+            if (children.len == 0) {
+                try w.print(".children = @as(?Slot{d}, null)", .{index});
+            } else {
+                try w.print(".children = @as(?Slot{d}, .{{ .props = {s}props", .{ index, scope.root });
+                for (carried) |loop_name| try w.print(", .{s} = {s}{s}", .{ loop_name, scope.root, loop_name });
+                try w.writeAll(" })");
+            }
+            try w.print("}}, {s});\n", .{scope.b});
 
             return;
         }
 
         try indent(w, depth);
-        try w.print("try b.element(\"{f}\", &.{{", .{std.zig.fmtString(tag)});
+        try w.print("try {s}.element(\"{f}\", &.{{", .{ scope.b, std.zig.fmtString(tag) });
         if (object.get("attrs")) |attrs| {
             for (attrs.array.items, 0..) |attr, index| {
                 const attr_name = attr.object.get("name").?.string;
@@ -230,7 +281,7 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
                     try w.print(".{{ .name = \"{f}\", .value = \"\" }}", .{std.zig.fmtString(attr_name)});
                 } else if (std.mem.eql(u8, kind, "path")) {
                     try w.print(".{{ .name = \"{f}\", .value = ", .{std.zig.fmtString(attr_name)});
-                    try pathText(w, value.object.get("path").?);
+                    try pathText(w, value.object.get("path").?, scope);
                     try w.writeAll(" }");
                 } else {
                     return error.MalformedIr;
@@ -239,10 +290,10 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
         }
         try w.writeAll("}, 0);\n");
 
-        try emitNodes(w, object.get("children").?.array.items, depth + 1);
+        try emitNodes(w, object.get("children").?.array.items, depth + 1, scope, slots);
 
         try indent(w, depth);
-        try w.writeAll("try b.close();\n");
+        try w.print("try {s}.close();\n", .{scope.b});
 
         return;
     }
@@ -252,11 +303,11 @@ fn emitNode(w: anytype, node: std.json.Value, depth: usize) EmitError!void {
 
 /// Write the Zig expression for an attribute value: a path, a bare attribute (present, written as an
 /// empty string), or a static string in the component form.
-fn emitAttrValue(w: anytype, value: std.json.Value) EmitError!void {
+fn emitAttrValue(w: anytype, value: std.json.Value, scope: Scope) EmitError!void {
     const kind = value.object.get("kind").?.string;
 
     if (std.mem.eql(u8, kind, "path")) {
-        return pathText(w, value.object.get("path").?);
+        return pathText(w, value.object.get("path").?, scope);
     }
 
     if (std.mem.eql(u8, kind, "static")) {
@@ -270,22 +321,122 @@ fn emitAttrValue(w: anytype, value: std.json.Value) EmitError!void {
     return error.MalformedIr;
 }
 
-/// Write the Zig expression a path denotes: `["title"]` is `props.title`, `["$tag"]` is the loop variable
-/// `tag`. The two forms are distinct in the IR so a loop variable can never be mistaken for a property.
-fn pathText(w: anytype, path: std.json.Value) EmitError!void {
+/// Write the Zig expression a path denotes. `["title"]` is `props.title`; `["$item"]` is the loop
+/// variable `item` where a `for` in this function binds it, and the slot's copy of it (`self.item`)
+/// where an enclosing slot carries it. Anything else is `props`, reached through the scope's root so
+/// the same path text works in `render` and inside a slot.
+fn pathText(w: anytype, path: std.json.Value, scope: Scope) EmitError!void {
     if (path != .array or path.array.items.len == 0) return error.MalformedIr;
 
-    // A loop variable is an identifier the enclosing `for` binds; anything else is a field of props. The
-    // decision is made on the first segment, because writing `props.` first is not recoverable.
     const head = path.array.items[0].string;
     if (head.len > 0 and head[0] == '$') {
         if (path.array.items.len != 1) return error.MalformedIr;
 
-        return w.print("{s}", .{head[1..]});
+        const name = head[1..];
+        for (scope.loops) |bound| if (std.mem.eql(u8, bound, name)) return w.print("{s}", .{name});
+        for (scope.carried) |carried| if (std.mem.eql(u8, carried, name)) return w.print("{s}{s}", .{ scope.root, name });
+
+        // A loop variable this scope can neither bind nor carry is one the generated code could not
+        // name: saying so beats emitting a name that does not resolve (or worse, one that does).
+        return error.MalformedIr;
     }
 
-    try w.writeAll("props");
+    try w.print("{s}props", .{scope.root});
     for (path.array.items) |segment| try w.print(".{s}", .{segment.string});
+}
+
+/// Emit the slot type for one component call.
+///
+/// The children become the body of `render`, and every value they name that the enclosing template
+/// holds — the caller's `props`, and each enclosing loop variable they use — is carried **by value** in
+/// the struct. That is not decoration: a nested function cannot read the enclosing function's runtime
+/// locals, so a slot that merely referred to `props` would not compile for any real (named) props type.
+/// Carrying them also means a child inside a loop can use the loop variable, which nothing else in Zig
+/// would let it do.
+fn emitSlot(
+    w: anytype,
+    children: []const std.json.Value,
+    carried: []const []const u8,
+    depth: usize,
+    scope: Scope,
+    index: u32,
+    slots: *u32,
+) EmitError!void {
+    try indent(w, depth);
+    try w.print("const Slot{d} = struct {{\n", .{index});
+    try indent(w, depth + 1);
+    try w.print("props: @TypeOf({s}props),\n", .{scope.root});
+    for (carried) |loop_name| {
+        try indent(w, depth + 1);
+        try w.print("{s}: @TypeOf({s}{s}),\n", .{ loop_name, scope.root, loop_name });
+    }
+    try indent(w, depth + 1);
+    try w.print("pub fn render(self: @This(), slot_b{d}: *zurtr.live.tree.Builder) anyerror!void {{\n", .{index});
+
+    var b_buf: [16]u8 = undefined;
+    const slot_b = std.fmt.bufPrint(&b_buf, "slot_b{d}", .{index}) catch return error.MalformedIr;
+
+    if (children.len == 0) {
+        try indent(w, depth + 2);
+        try w.writeAll("_ = self;\n");
+        try indent(w, depth + 2);
+        try w.print("_ = {s};\n", .{slot_b});
+    } else {
+        try emitNodes(w, children, depth + 2, .{
+            .b = slot_b,
+            .root = "self.",
+            .loops = &.{},
+            .carried = carried,
+        }, slots);
+    }
+
+    try indent(w, depth + 1);
+    try w.writeAll("}\n");
+    try indent(w, depth);
+    try w.writeAll("};\n");
+}
+
+/// The names a slot has to carry: the loop variables and already-carried names its children reference.
+/// A name a `for` inside the slot binds is local to it and is not carried.
+fn carriedFor(children: []const std.json.Value, scope: Scope, buf: *[max_carried][]const u8) EmitError![]const []const u8 {
+    var len: usize = 0;
+    for (scope.loops) |name| {
+        if (!referenced(children, name)) continue;
+        if (len == buf.len) return error.MalformedIr;
+        buf[len] = name;
+        len += 1;
+    }
+    for (scope.carried) |name| {
+        if (!referenced(children, name)) continue;
+        if (len == buf.len) return error.MalformedIr;
+        buf[len] = name;
+        len += 1;
+    }
+
+    return buf[0..len];
+}
+
+/// Does any path in this subtree name `$name`? A path is an array whose first element is the head, so
+/// the scan looks at every array it meets and then recurses into it.
+fn referenced(nodes: []const std.json.Value, name: []const u8) bool {
+    for (nodes) |node| {
+        if (node != .object) continue;
+
+        var it = node.object.iterator();
+        while (it.next()) |entry| {
+            const value = entry.value_ptr.*;
+            if (value != .array) continue;
+
+            const items = value.array.items;
+            if (items.len != 0 and items[0] == .string) {
+                const head = items[0].string;
+                if (head.len > 1 and head[0] == '$' and std.mem.eql(u8, head[1..], name)) return true;
+            }
+            if (referenced(items, name)) return true;
+        }
+    }
+
+    return false;
 }
 
 test "a template lowers to Zig that parses, and the IR says what it should" {
@@ -337,20 +488,70 @@ test "a bare attribute lowers to a present attribute with an empty value" {
 test "what the subset refuses comes back as TemplateRejected, with the line" {
     const allocator = std.testing.allocator;
 
-    // Children on a component: there is no decided convention for passing them, and dropping them
-    // silently is worse than refusing.
-    try std.testing.expectError(error.TemplateRejected, compile_template(allocator,
-        \\<div>
-        \\  <Card>
-        \\    <p>child</p>
-        \\  </Card>
-        \\</div>
-    ));
-
     // An expression after `props.`: a path segment is a field name, and the emitter writes it into the
     // generated source verbatim, so `props.a + 1` would become code rather than a compile error here.
     try std.testing.expectError(error.TemplateRejected, compile_template(allocator, "<div>{props.a + 1}</div>"));
 
     // A loop variable named `b` would shadow the Builder inside the generated function.
     try std.testing.expectError(error.TemplateRejected, compile_template(allocator, "<ul>{props.items.map(b => <li>{b}</li>)}</ul>"));
+
+    // The names a generated slot binds: `self` is its receiver and `slot_b0`/`Slot0` are the names the
+    // emitter writes for the first slot.
+    try std.testing.expectError(error.TemplateRejected, compile_template(allocator, "<ul>{props.items.map(self => <li>{self}</li>)}</ul>"));
+    try std.testing.expectError(error.TemplateRejected, compile_template(allocator, "<ul>{props.items.map(slot_b0 => <li>{slot_b0}</li>)}</ul>"));
+    try std.testing.expectError(error.TemplateRejected, compile_template(allocator, "<ul>{props.items.map(Slot0 => <li>{Slot0}</li>)}</ul>"));
+}
+
+test "a component's children become a slot it calls" {
+    const allocator = std.testing.allocator;
+
+    const generated = try compile_template(allocator,
+        \\<Card title="t">
+        \\  <p>{props.body}</p>
+        \\</Card>
+    );
+    defer allocator.free(generated);
+
+    // The slot type carries the caller's props by value and renders the children against its own builder.
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const Slot0 = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "props: @TypeOf(props),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn render(self: @This(), slot_b0: *zurtr.live.tree.Builder) anyerror!void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "try slot_b0.text(self.props.body);") != null);
+    // …and the call passes it, addressed through the props type rather than the value.
+    try std.testing.expect(std.mem.indexOf(u8, generated, "try @TypeOf(props).Card(.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".children = @as(?Slot0, .{ .props = props })") != null);
+
+    var ast = try std.zig.Ast.parse(allocator, generated, .{ .mode = .zig });
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "a component with no children passes a null slot" {
+    const allocator = std.testing.allocator;
+
+    const generated = try compile_template(allocator, "<Card title=\"t\"/>");
+    defer allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".children = @as(?Slot0, null)") != null);
+
+    var ast = try std.zig.Ast.parse(allocator, generated, .{ .mode = .zig });
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+}
+
+test "a slot carries the loop variables its children use" {
+    const allocator = std.testing.allocator;
+
+    const generated = try compile_template(allocator,
+        \\<ul>{props.items.map(item => <Card><p>{item}</p></Card>)}</ul>
+    );
+    defer allocator.free(generated);
+
+    try std.testing.expect(std.mem.indexOf(u8, generated, "item: @TypeOf(item),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "try slot_b0.text(self.item);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, ".item = item })") != null);
+
+    var ast = try std.zig.Ast.parse(allocator, generated, .{ .mode = .zig });
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
 }
