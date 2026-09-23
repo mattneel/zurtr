@@ -368,11 +368,19 @@ pub fn build(b: *std.Build) void {
         // translation unit) are only addressable by the build runner, and a template that reaches
         // past this set gets the compiler's own "no module named '…'", which names exactly what to
         // add here.
+        // The compiler resolves a module's source path from the directory it runs in, and the evaluator
+        // runs it from its own work directory - so the path has to be absolute. This API does not
+        // expose the build root as a string (`Graph` carries handles, and `addOptionPath` resolves to
+        // a root-relative path), so the absolute base comes from `$PWD`: the directory the build was
+        // invoked from, which is what every relative path in this file is already resolved against.
+        // If it is missing the path stays relative and the test in tools/zeex_live.zig fails, rather
+        // than the editor reporting a module it cannot find.
+        const build_root = b.graph.environ_map.get("PWD") orelse ".";
+        const zurtr_root = b.pathResolve(&.{ build_root, "src", "root.zig" });
+
         const editor_options = b.addOptions();
         editor_options.addOption([]const []const u8, "eval_root_deps", &.{"zurtr"});
-        editor_options.addOption([]const []const u8, "eval_modules", &.{
-            b.fmt("-Mzurtr={s}", .{b.pathFromRoot("src/root.zig")}),
-        });
+        editor_options.addOption([]const u8, "eval_zurtr_root", zurtr_root);
         zeex_live_module.addOptions("build_options", editor_options);
 
         const zeex_live = b.addExecutable(.{ .name = "zeex-live", .root_module = zeex_live_module });

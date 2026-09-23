@@ -6,15 +6,28 @@
 //! This is the first half of the live editor: the feedback loop that turns a keystroke into
 //! "here is the Zig your template lowered to, or here is the line it rejected".
 //!
-//! **`--preview` is wired to the evaluator and blocked one level down.** It renders the
-//! template for real — generated `render`, plus a props struct scanned out of the generated
-//! source, handed to `zigeval.Evaluator` as a prelude — but the evaluator's scratch file is a
-//! standalone `build-obj` with no module imports, so a prelude cannot reach `zurtr` and the
-//! preview reports the compiler's own `no module named 'zurtr' available within module 'eval'`.
-//! Two ways out, neither taken yet: give the evaluator an option to pass `--dep`/`-M` for a
-//! module graph (absolute paths, so the editor's build would embed them), or stop using the
-//! evaluator here and build a scratch package incrementally, which trades the 2.7 ms eval for
-//! a small `zig build` per keystroke. The props scanner below is written and correct either way.
+//! **`--preview` is blocked by the evaluator's execution model, not by its module graph.** The
+//! graph part is solved: the prelude — the generated `render` plus a props struct scanned out of
+//! it — is compiled against a module graph this build embeds (`--dep zurtr -Mzurtr=<absolute
+//! src/root.zig>`, absolute because the evaluator's work directory is not the build root), and
+//! the compiler now resolves `zurtr.live.tree.Builder` instead of reporting `no module named
+//! 'zurtr'`. What it then reports is that the render cannot run **at comptime at all**:
+//!
+//!     error: unable to evaluate comptime expression
+//!         const addr = @intFromPtr(ptr);          // mem.alignPointerOffset, from FixedBufferAllocator
+//!     error: comptime dereference requires 'heap.ArenaAllocator.Node' to have a well-defined layout
+//!
+//! The first is every allocator in the standard library (`FixedBufferAllocator.alloc` aligns
+//! through `@intFromPtr`, which is not comptime-evaluable here); the second is the arena the
+//! render tree is built on, which loses even with a comptime-safe child allocator. So no module
+//! graph makes a comptime render possible — the value would have to come from running the code,
+//! not evaluating it.
+//!
+//! Rendering at run time does work, and is what a preview needs if it is to print HTML:
+//! `zig run` with this same module graph renders the framework's own tree in 0.20 s warm and
+//! 0.72 s after a source change (cold 0.73 s), against the 1.8 ms this tool spends lowering a
+//! template. That is a preview-on-save budget, not a per-keystroke one, and choosing between it
+//! and a compile-errors-only preview is a decision rather than a wiring detail.
 //!
 //! Two things carried over from the evaluator, because both cost an afternoon to learn:
 //!
@@ -28,6 +41,7 @@
 const std = @import("std");
 const zurtr = @import("zurtr");
 const zigeval = @import("zigeval");
+const build_options = @import("build_options");
 
 /// Lowered once at startup to warm the engine. Deliberately small: it only has to be a
 /// template the transform walks end to end — an element, an interpolation, a conditional.
@@ -195,10 +209,19 @@ fn preview(
     // The evaluator's first call is the expensive one, so it happens here rather than on the
     // first save: this is the startup warm-up the client was written to make possible.
     const started = std.Io.Timestamp.now(io, .awake);
+    // The module graph the prelude imports through. `eval_zurtr_root` is the absolute source path the
+    // build resolved, so the compiler can find it from the evaluator's work directory.
+    const module_args = [_][]const u8{
+        try std.fmt.allocPrint(gpa, "-Mzurtr={s}", .{build_options.eval_zurtr_root}),
+    };
+    defer gpa.free(module_args[0]);
+
     const evaluator = try zigeval.Evaluator.create(gpa, io, .{
         .zig_exe = options.zig_exe,
         .work_dir = ".zig-cache/zeex-live",
         .prelude = prelude.written(),
+        .root_deps = build_options.eval_root_deps,
+        .modules = &module_args,
     });
     defer evaluator.destroy();
 
@@ -357,6 +380,25 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
 
 fn msSince(io: std.Io, started: std.Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(started.untilNow(io, .awake).toNanoseconds())) / std.time.ns_per_ms;
+}
+
+test "the embedded module graph is present, so the evaluator can reach the framework" {
+    // A build that drops these puts `--preview` back to reporting `no module named 'zurtr'`, which is
+    // indistinguishable from "the preview is not wired at all" - so they are asserted here rather
+    // than trusted to survive a refactor of build.zig.
+    var names_zurtr = false;
+    for (build_options.eval_root_deps) |dep| {
+        if (std.mem.eql(u8, dep, "zurtr")) names_zurtr = true;
+    }
+    try std.testing.expect(names_zurtr);
+
+    // Absolute, because the evaluator's work directory is not the build root.
+    try std.testing.expect(build_options.eval_zurtr_root.len != 0);
+    try std.testing.expect(std.fs.path.isAbsolute(build_options.eval_zurtr_root));
+
+    const arg = try std.fmt.allocPrint(std.testing.allocator, "-Mzurtr={s}", .{build_options.eval_zurtr_root});
+    defer std.testing.allocator.free(arg);
+    try std.testing.expect(std.mem.startsWith(u8, arg, "-Mzurtr=/"));
 }
 
 test "the warm-up template lowers to the generated shape" {

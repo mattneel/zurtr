@@ -71,6 +71,19 @@ pub const Options = struct {
     work_dir: []const u8 = ".zig-cache/zigeval-listen",
     /// Top-level declarations, placed below the comptime block.
     prelude: []const u8 = "const std = @import(\"std\");",
+    /// Module names the evaluated file itself may import. Each becomes a `--dep` entry for the root
+    /// module (which is `eval.zig`, and must be the first module declared).
+    ///
+    /// Two fields rather than one argument list because of the compiler's own grammar, from
+    /// `zig build-obj -h`: `--dep` "add[s] an entry to the next module's import table", and in `-M`,
+    /// "the first module is the main module". So the root's imports have to be declared before the
+    /// root, and every other module after it — one appended list would attach the root's imports to
+    /// whichever module followed, silently.
+    root_deps: []const []const u8 = &.{},
+    /// Module declarations for the evaluated file's imports, in compiler syntax — `--dep` groups and
+    /// `-M<name>=<path>` pairs, in that order and with absolute paths, since the evaluator's work
+    /// directory is not the caller's. Placed after the root module declaration.
+    modules: []const []const u8 = &.{},
 };
 
 pub const Result = union(enum) {
@@ -101,6 +114,11 @@ pub const Evaluator = struct {
     lock: Io.File,
     child: std.process.Child,
     prelude: []u8,
+    /// The child's argv, owned here because `std.process.Child` holds it for the child's lifetime.
+    argv: [][]const u8,
+    /// Index in `argv` from which the entries are this evaluator's own copies of caller-supplied
+    /// arguments (everything before it is a literal). Freed in `destroy`.
+    argv_owned_from: usize,
     /// Version string from the compiler's `zig_version` greeting.
     version: []u8,
     nonce: u64 = 0,
@@ -136,13 +154,36 @@ pub const Evaluator = struct {
         // The root file must exist before the compiler starts.
         try ev.dir.writeFile(io, .{ .sub_path = "eval.zig", .data = "comptime {}\n" });
 
+        // The root is declared as `-Mroot=` rather than positionally so it can carry an import
+        // table: a `-M` module may not follow a positional root ("main module provided both by
+        // '-Mx=y' and by positional argument"), and `--dep` applies to the module that follows it.
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        argv.appendSlice(gpa, &.{
+            options.zig_exe, "build-obj",   "-fno-emit-bin", "-fincremental",
+            "--listen=-",    "--cache-dir", "cache",
+        }) catch return error.OutOfMemory;
+        ev.argv_owned_from = argv.items.len;
+        // The caller's arguments are copied: a caller may build them on the stack, and the child's
+        // argv has to outlive this call.
+        for (options.root_deps) |dep| {
+            argv.append(gpa, "--dep") catch return error.OutOfMemory;
+            argv.append(gpa, gpa.dupe(u8, dep) catch return error.OutOfMemory) catch return error.OutOfMemory;
+        }
+        argv.append(gpa, "-Mroot=eval.zig") catch return error.OutOfMemory;
+        for (options.modules) |arg| {
+            argv.append(gpa, gpa.dupe(u8, arg) catch return error.OutOfMemory) catch return error.OutOfMemory;
+        }
+        // `-j1` (behaviour 6): the worker pool would otherwise follow the affinity mask, and one
+        // expression cannot use more than one worker.
+        argv.append(gpa, "-j1") catch return error.OutOfMemory;
+
+        ev.argv = argv.toOwnedSlice(gpa) catch return error.OutOfMemory;
+        errdefer gpa.free(ev.argv);
+        errdefer for (ev.argv[ev.argv_owned_from..]) |arg| gpa.free(arg);
+
         ev.child = try std.process.spawn(io, .{
-            .argv = &.{
-                // `-j1` (behaviour 6): the worker pool would otherwise follow the affinity
-                // mask, and one expression cannot use more than one worker.
-                options.zig_exe, "build-obj",   "-fno-emit-bin", "-fincremental",
-                "--listen=-",    "--cache-dir", "cache",         "eval.zig", "-j1",
-            },
+            .argv = ev.argv,
             .cwd = .{ .dir = ev.dir },
             .stdin = .pipe,
             .stdout = .pipe,
@@ -169,6 +210,8 @@ pub const Evaluator = struct {
         }
         ev.lock.close(io);
         ev.dir.close(io);
+        for (ev.argv[ev.argv_owned_from..]) |arg| gpa.free(arg);
+        gpa.free(ev.argv);
         gpa.free(ev.prelude);
         gpa.free(ev.version);
         gpa.destroy(ev);
