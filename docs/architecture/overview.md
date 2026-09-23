@@ -24,7 +24,7 @@ one static executable.
 | `data` | Queries, transactions, migrations, adapters | runtime, zix | implemented: the contract plus the Turso adapter at four tiers (`docs/modules/data.md`) |
 | `domain` | Resources, typed actions, validation, authorization, relationships | data, runtime | implemented: `src/domain/` (action, policy, validation); the inventory in `src/root.zig` is being updated to match (`decisions.md` D7) |
 | `live` | Session state, events, components, render/patch, DOM protocol | runtime, zix | implemented: `src/live/{protocol,pubsub,tree,patch}.zig` |
-| `jobs` | Durable queues, schedules, retries, concurrency, cancellation | data, domain (action refs), runtime | declared |
+| `jobs` | Durable queues, schedules, retries, concurrency, cancellation | data, domain (action refs), runtime | implemented: durable queue, schedules, retries, cancellation (`docs/modules/jobs.md`) |
 | `agents` | Signals, decisions, effects, checkpoints, durable execution | data, domain, jobs, runtime | declared |
 | `app` | Config, routes, middleware, auth, lifecycle, telemetry; wires the rest | all of the above | declared |
 | `dev` | Incremental builds, reload, diagnostics, tests, inspection | build system; not linked into release apps | declared |
