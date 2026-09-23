@@ -15,7 +15,7 @@ no session type in the tree yet.
 
 1. **Initial render.** An HTTP request handled by `app` builds a `live.Session`
    descriptor (view type, initial state, route) and renders the initial HTML
-   with `live.tree`. The HTML carries the session token and per-element patch
+   with the render tree (`src/live/tree.zig`). The HTML carries the session token and per-element patch
    ids.
 2. **Attach.** The browser opens a **WebTransport** session to the live path and
    sends `hello` with the token and the client's last `rev`. The worker either

@@ -36,10 +36,10 @@ and the table is the side being corrected (`decisions.md` D7). *Declared* means
 this tree has the contract and no implementation; a module moves to
 *implemented* when its first real surface lands.
 
-Optional layers: `script` (QuickJS-ng, `docs/modules/zscript.md`) and `zeex`
+Optional layers: `zscript` (QuickJS-ng, `docs/modules/zscript.md`) and `zeex`
 (JSX lowered to Zig at build time by a script the build runs, `src/zeex/`) sit
 beside the modules rather than in the dependency order — nothing below them
-depends on them, and everything above them can. `script` is behavior a host can
+depends on them, and everything above them can. `zscript` is behavior a host can
 replace without a native rebuild, and the authority a script can reach is exactly
 the host functions the host registered; `zeex` is a build-time lowering that
 leaves nothing of itself in the running program. Both are behind build options
