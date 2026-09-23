@@ -109,6 +109,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ZScript as a named module: it is imported by `root.zig` and by ZEEX's compiler, and a
+    // relative import cannot cross a module boundary (ZEEX reaches up to it from `src/zeex/`).
+    const zscript = b.addModule("zscript", .{
+        .root_source_file = b.path("src/zscript/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quickjs", .module = quickjs }},
+    });
+
     // --- zurtr --------------------------------------------------------------
     const zurtr_options = b.addOptions();
     zurtr_options.addOption(bool, "turso", enable_turso);
@@ -118,6 +127,7 @@ pub fn build(b: *std.Build) void {
     var zurtr_imports: std.ArrayList(std.Build.Module.Import) = .empty;
     zurtr_imports.append(b.allocator, .{ .name = "zix", .module = zix }) catch @panic("OOM");
     zurtr_imports.append(b.allocator, .{ .name = "quickjs", .module = quickjs }) catch @panic("OOM");
+    zurtr_imports.append(b.allocator, .{ .name = "zscript", .module = zscript }) catch @panic("OOM");
     if (turso_sync_module) |module| {
         // A sync build has one module for the whole stack: the SDK module is rooted in the same source
         // tree and re-exports the base binding as `base`. Zig will not put one file in two modules of
@@ -273,10 +283,34 @@ pub fn build(b: *std.Build) void {
         script_test_run = run_script_tests;
     }
 
+    // ZEEX's compiler is self-contained: it imports the script layer and nothing above it, so it
+    // gets its own step rather than riding inside `test-zurtr`, where a failure in it would be
+    // indistinguishable from a failure anywhere else in that binary.
+    var zeex_test_run: ?*std.Build.Step.Run = null;
+    if (enable_zscript) {
+        const zeex_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/zeex/compile.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zscript", .module = zscript }},
+            }),
+        });
+        // Zig fails with splitType errors on the QuickJS translation unit without LLVM.
+        zeex_tests.use_llvm = true;
+        zeex_tests.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
+
+        const run_zeex_tests = b.addRunArtifact(zeex_tests);
+        const test_zeex_step = b.step("test-zeex", "Run the template compiler's tests (lowers JSX and parses the generated Zig)");
+        test_zeex_step.dependOn(&run_zeex_tests.step);
+        zeex_test_run = run_zeex_tests;
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_zurtr_tests.step);
     test_step.dependOn(&run_zix_tests.step);
     if (data_test_run) |run| test_step.dependOn(&run.step);
     if (nodes_test_run) |run| test_step.dependOn(&run.step);
     if (script_test_run) |run| test_step.dependOn(&run.step);
+    if (zeex_test_run) |run| test_step.dependOn(&run.step);
 }

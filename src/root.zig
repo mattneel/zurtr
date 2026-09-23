@@ -44,7 +44,7 @@ pub const domain = struct {
 ///
 /// The engine is behind `-Dzscript`; the seam's own types do not need it, so a build that never asks
 /// for the engine never pays for one.
-pub const zscript = @import("zscript/root.zig");
+pub const zscript = @import("zscript");
 
 /// ZEEX: JSX templates lowered to Zig at build time, by a script the vendored engine runs.
 ///

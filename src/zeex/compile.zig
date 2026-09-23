@@ -18,7 +18,7 @@
 //! template never has to remember which interpolation was the safe one.
 
 const std = @import("std");
-const Script = @import("../zscript/root.zig").Script;
+const Script = @import("zscript").Script;
 
 /// The transform, embedded so the compiler is self-contained: no path to find, no file to ship.
 const transform_source = @embedFile("transform.js");
