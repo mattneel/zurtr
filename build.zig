@@ -157,6 +157,15 @@ pub fn build(b: *std.Build) void {
     // --- executable ---------------------------------------------------------
     // Applications deploy as one static executable, and this is the framework's own entry point
     // (assembly and roles hang off it).
+    // `zurtr new` writes a project that depends on this tree by path, so the executable needs to
+    // know where this tree is. The resolved path is absolute, which matters because the generated
+    // project is somewhere else on disk and a relative path would resolve against its directory.
+    const cli_options = b.addOptions();
+    // Untracked: a directory cannot be hashed as a build input, and this path is not an input —
+    // it is a string the generator writes into someone else's build.zig.zon.
+    cli_options.addOptionPathUntracked("zurtr_source_path", b.path("."));
+
+    const clap_dep = b.dependency("clap", .{ .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{
         .name = "zurtr",
         .root_module = b.createModule(.{
@@ -165,9 +174,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zurtr", .module = zurtr },
+                .{ .name = "clap", .module = clap_dep.module("clap") },
             },
         }),
     });
+    exe.root_module.addOptions("cli_options", cli_options);
     if (enable_zscript) {
         exe.use_llvm = true;
         exe.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));
@@ -292,6 +303,22 @@ pub fn build(b: *std.Build) void {
         script_test_run = run_script_tests;
     }
 
+    // The command-line layer: the generator's manifest and — once the engine lands — the renderer.
+    // Its tests cannot ride inside `test-zurtr`, since neither file is part of the framework module,
+    // and a test nobody runs is a comment.
+    {
+        const scaffold_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/scaffold.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        const run_scaffold_tests = b.addRunArtifact(scaffold_tests);
+        const test_cli_step = b.step("test-cli", "Run the project generator's tests");
+        test_cli_step.dependOn(&run_scaffold_tests.step);
+    }
+
     // ZEEX's compiler is self-contained: it imports the script layer and nothing above it, so it
     // gets its own step rather than riding inside `test-zurtr`, where a failure in it would be
     // indistinguishable from a failure anywhere else in that binary.
@@ -329,6 +356,25 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zigeval", .module = zigeval },
             },
         });
+        // The editor evaluates a prelude that imports the framework, and the evaluator runs the
+        // compiler from its own work directory, so every module path it is given has to be absolute.
+        // `eval_root_deps` is what the evaluated file itself imports; `eval_modules` is the graph
+        // behind it (see the argument grammar on `zigeval.Options`, and the test in
+        // tools/zeex_live.zig that fails loudly if a build drops either).
+        //
+        // The set is the reach a preview has: `zurtr.live.tree.Builder`, which the generated code
+        // names, plus whatever that pulls in. It is deliberately not the whole framework graph - the
+        // generated-file modules (`build_options`, `zon_options`, the Brotli dictionary, the QuickJS
+        // translation unit) are only addressable by the build runner, and a template that reaches
+        // past this set gets the compiler's own "no module named '…'", which names exactly what to
+        // add here.
+        const editor_options = b.addOptions();
+        editor_options.addOption([]const []const u8, "eval_root_deps", &.{"zurtr"});
+        editor_options.addOption([]const []const u8, "eval_modules", &.{
+            b.fmt("-Mzurtr={s}", .{b.pathFromRoot("src/root.zig")}),
+        });
+        zeex_live_module.addOptions("build_options", editor_options);
+
         const zeex_live = b.addExecutable(.{ .name = "zeex-live", .root_module = zeex_live_module });
         zeex_live.use_llvm = true;
         zeex_live.root_module.linkLibrary(b.dependency("quickjs_ng", .{ .target = target, .optimize = optimize }).artifact("quickjs-ng"));

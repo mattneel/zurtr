@@ -36,6 +36,11 @@
         // nothing is fetched; its own native build (Turso compiled from Rust source) only runs when a
         // build actually reaches the adapter, which is why the base build stays dependency-free.
         .turso = .{ .path = "deps/turso" },
+        // The command-line parser, vendored at deps/zig-clap. `zurtr new` has enough flags that
+        // hand-rolled parsing would be wrong in the ways hand-rolled parsing is wrong: a missing
+        // value silently becoming an empty string, `--flag=value` and `--flag value` disagreeing,
+        // an unknown flag being ignored.
+        .clap = .{ .path = "deps/zig-clap" },
         // The script engine, vendored at deps/quickjs-ng (see its UPSTREAM.md). Its QuickJS C sources
         // are a package dependency of the binding, so nothing is fetched unless -Dscript asks for it.
         .quickjs_ng = .{ .path = "deps/quickjs-ng" },
