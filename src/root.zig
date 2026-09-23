@@ -17,6 +17,9 @@ pub const zix = @import("zix");
 /// Shared runtime primitives (ownership, pools, ids, clocks).
 pub const runtime = struct {
     pub const pool = @import("runtime/pool.zig");
+    /// Bounded lock-free multi-producer multi-consumer queue: the substrate under per-worker queues,
+    /// work stealing, and cross-worker completion delivery.
+    pub const mpmc = @import("runtime/mpmc.zig");
 };
 
 /// Live UI: session state, events, render/patch, protocol.
@@ -75,6 +78,7 @@ test "zurtr module builds and links the transport" {
 
 test {
     _ = runtime.pool;
+    _ = runtime.mpmc;
     _ = live.protocol;
     _ = live.pubsub;
     _ = data;
