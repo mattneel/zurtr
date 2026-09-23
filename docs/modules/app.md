@@ -5,8 +5,11 @@ authentication, telemetry, and the bridges that wire `domain`, `data`, `live`,
 `jobs`, and `agents` to HTTP and to each other. It is the only module allowed
 to depend on all others.
 
-Status: **declared** — no implementation in this tree (`src/root.zig`'s module
-table). The configuration sketch below names types the tree does not have yet;
+Status: **declared** — read the status from `src/root.zig`'s `modules` table, which is
+the inventory of record (`zurtr modules` prints it); this document is the contract the
+module is held to, and the sections below are its design.
+
+The configuration sketch below names types the tree does not have yet;
 the exceptions are the transport type and the database handle, which are named
 after the real ones (`deps/zix/src/tcp/http1/config.zig`, `src/data/root.zig`).
 

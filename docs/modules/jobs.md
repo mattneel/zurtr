@@ -3,8 +3,11 @@
 Scope: durable queues, schedules, retries, concurrency, cancellation. Delivery
 is at-least-once; idempotency is the caller's contract (`contracts.md` §5).
 
-Status: **declared** — no implementation in this tree (`src/root.zig`'s module
-table). The model below is written in the dialect of the adapter that exists:
+Status: **declared** — read the status from `src/root.zig`'s `modules` table, which is
+the inventory of record (`zurtr modules` prints it); this document is the contract the
+module is held to, and the sections below are its design.
+
+The model below is written in the dialect of the adapter that exists:
 Turso, which is SQLite-compatible (`src/data/turso_adapter.zig`), with four
 tiers and a single writer per database (`docs/modules/data.md`). PostgreSQL
 remains a declared adapter, unbuilt (`decisions.md` D5).

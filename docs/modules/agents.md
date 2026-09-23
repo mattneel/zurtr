@@ -4,8 +4,11 @@ Scope: stateful workflows with durable execution — typed signals, decisions,
 effects, checkpoints. Agents reuse `jobs` (execution) and `domain` (actions as
 tools); they add durable state and replay with recorded effects.
 
-Status: **declared** — no implementation in this tree (`src/root.zig`'s module
-table). The tables below are in the same dialect as `jobs.md`'s — Turso /
+Status: **declared** — read the status from `src/root.zig`'s `modules` table, which is
+the inventory of record (`zurtr modules` prints it); this document is the contract the
+module is held to, and the sections below are its design.
+
+The tables below are in the same dialect as `jobs.md`'s — Turso /
 SQLite, integer microseconds, single writer per database (`decisions.md` D5/D6).
 
 ## Model

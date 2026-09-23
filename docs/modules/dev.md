@@ -3,9 +3,12 @@
 Scope: the development loop, diagnostics, tests, and measurement. This module
 is never linked into release applications.
 
-Status: **declared** — no implementation in this tree (`src/root.zig`'s module
-table; `src/main.zig` implements only `zurtr modules` and `zurtr help`). The
-command surface below is the design.
+Status: **declared** — read the status from `src/root.zig`'s `modules` table, which is
+the inventory of record (`zurtr modules` prints it); this document is the contract the
+module is held to, and the sections below are its design.
+
+`src/main.zig` implements `zurtr modules` and `zurtr help` today; the command
+surface below is the design.
 
 ## Commands
 
