@@ -156,6 +156,17 @@ Each of these cost someone an afternoon. They are here so it is not two afternoo
 - **Test scaffolding hides defects.** An arena frees what the adapter forgot; a test harness that
   compares microseconds to milliseconds passes whatever it is given. Ask what the scaffolding makes
   invisible, and assert the premise (`kill(pid, 0)`, not the row that claims the process is alive).
+- **A plausible version string is not a version.** `.minimum_zig_version = "0.17.0"` sends anyzig
+  looking for `zig-x86_64-linux-0.17.0.tar.xz`, which 404s — 0.17.0 has not been released. Pin the
+  exact dev build: `0.17.0-dev.2264+230c63650`. This has broken the build in `deps/quickjs-ng` and
+  then again in `zdl`; when a tree stops building for no clear reason, read its pin before its code.
+- **A verification that ran before the last commit is not a verification.** zdl's port measured
+  111/111 passing and then landed one more commit changing the toolchain pin — so the green result
+  described a state that never existed in history. Run the gate against what you are about to
+  commit, not what you had a moment ago.
+- **A path dependency cannot escape its package root.** A vendored package's `build.zig.zon` must
+  point at something beneath itself (`libs/zpool`), never up and out (`../zpool`). This is why
+  `zgpu` carries its patched `zpool` inside `deps/zgpu/` rather than sharing zurtr's `deps/`.
 - **Watch it fail once.** A safety test nobody has seen fail is a comment. Sabotage the thing it
   protects and confirm the test notices; the `Tx` leak test names three leaked handles exactly
   because someone did.
