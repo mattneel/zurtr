@@ -33,7 +33,7 @@ serves a socket.
 1. **Initial render.** An HTTP request handled by `app` builds a `live.Session`
    descriptor (view type, initial state, route) and renders the initial HTML
    with the render tree (`Tree.writeHtml`). The HTML carries the session token
-   and per-element patch ids — the ids are `tree.zig`'s `data-z` attributes; the
+   and per-element patch ids — the ids are `tree.zig`'s `z-id` attributes; the
    token is the session layer's, which does not exist.
 2. **Attach.** The browser opens a **WebTransport** session to the live path and
    sends `hello` with the token and the client's last `rev`. The worker either
@@ -137,7 +137,7 @@ protocol does not already have.
 
 An escape hatch for client-owned behaviour is already expressible: `raw` nodes are client-owned DOM
 regions the server never patches into. A hook is therefore a `raw` region with a mount callback registered
-against its `data-z` id — client-side code that owns its subtree, exactly where the server has promised
+against its `z-id` id — client-side code that owns its subtree, exactly where the server has promised
 not to write. Nothing in the tree, the patcher or the protocol has to change for it, which is why it can
 be deferred without costing anything later.
 
@@ -148,8 +148,8 @@ A single representation serves initial HTML and later patches:
 - Nodes: `Kind = {element, text, raw, fragment}`. No component nodes: components
   expand at render time; identity is expressed by keys and structure.
 - **A node's id is its index in the tree's node list**, so `node(id).id == id`,
-  and every element emits `data-z="<its own id>"` in addition to its user
-  attributes. `fragment` emits only its children (never a `data-z`), `raw` emits
+  and every element emits `z-id="<its own id>"` in addition to its user
+  attributes. `fragment` emits only its children (never a `z-id`), `raw` emits
   its bytes verbatim, `text` emits escaped text. Ids are the patch addressing
   scheme and are stable for as long as the tree lives.
 - **Keys** (`key: u32`, `0` = keyless) mark children of lists whose identity must

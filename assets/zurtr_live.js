@@ -1,6 +1,6 @@
 /*!
  * zurtr live browser bridge - no-build-step DOM client for the zurtr Live UI. Spec:
- * docs/modules/live.md §Render representation (data-z ids), §Patch ops, §Protocol (frames);
+ * docs/modules/live.md §Render representation (z-id ids), §Patch ops, §Protocol (frames);
  * contracts.md §6 (focus/selection/form survival, resync); dev.md (paint beacon). One global: window.ZurtrLive.
  *
  * The live channel is WebTransport over HTTP/3 (docs/architecture/decisions.md D3); an explicit
@@ -14,7 +14,7 @@
   const BACKOFF_MIN = 100, BACKOFF_MAX = 5000;
   const cfg = { token: null, rev: 0, endpoint: null };
   const pending = new Map(); // event id -> {id, ev, payload, el}: sent, not yet acked
-  const timers = new Map();  // element -> data-z-change debounce timer
+  const timers = new Map();  // element -> z-change debounce timer
   let sock = null, tries = 0, retryT = 0, flushT = 0, closed = false;
   let nextId = 1, batch = [], delegated = false, beacon = false, readyDone = false, readyResolve = null;
   const ready = new Promise((resolve) => { readyResolve = resolve; });
@@ -27,7 +27,7 @@
   const esc = (v) => (window.CSS && CSS.escape) ? CSS.escape(String(v)) : String(v);
   // Ids are resolved against the live DOM on use, so a resync needs no index rebuild.
   const one = (s, sel) => { try { return s.querySelector(sel); } catch (e) { return null; } };
-  const q = (s, id) => id == null ? null : one(s, '[data-z="' + esc(id) + '"]');
+  const q = (s, id) => id == null ? null : one(s, '[z-id="' + esc(id) + '"]');
   const qName = (s, n) => n ? one(s, '[name="' + esc(n) + '"]') : null;
   // Server HTML carries fresh ids; <template> parses it inertly (no script execution).
   const fragment = (html) => {
@@ -153,9 +153,9 @@
     }
   }
 
-  // data-z-val is JSON: an object merges into the payload, anything else becomes `value`.
+  // z-val is JSON: an object merges into the payload, anything else becomes `value`.
   function payloadOf(el) {
-    const payload = {}, raw = attr(el, "data-z-val");
+    const payload = {}, raw = attr(el, "z-val");
     if (raw !== null) {
       let p = null, ok = true;
       try { p = JSON.parse(raw); } catch (e) { ok = false; }
@@ -176,34 +176,34 @@
     return el;
   }
 
-  const onClick = (e) => fire(e, "data-z-ev");
-  const onKeyDown = (e) => { if (e.key === "Enter" && !e.isComposing) fire(e, "data-z-key"); }; // send on Enter
+  const onClick = (e) => fire(e, "z-ev");
+  const onKeyDown = (e) => { if (e.key === "Enter" && !e.isComposing) fire(e, "z-key"); }; // send on Enter
 
   function onSubmit(e) {
-    const form = near(e.target, "[data-z-form]");
+    const form = near(e.target, "[z-form]");
     if (!form) return;
     e.preventDefault(); // the client owns the submit; the server decides what happens next
-    sendEvent(form.getAttribute("data-z-form"), payloadOf(form), form);
+    sendEvent(form.getAttribute("z-form"), payloadOf(form), form);
   }
 
   function onChange(e) {
     const target = e.target;
     if (!target || target.nodeType !== 1) return;
-    if (target.type === "file" && target.hasAttribute("data-z-upload")) upload(target); // live.md §Protocol §Uploads
-    const el = near(target, "[data-z-change]");
+    if (target.type === "file" && target.hasAttribute("z-upload")) upload(target); // live.md §Protocol §Uploads
+    const el = near(target, "[z-change]");
     if (!el) return;
-    const name = el.getAttribute("data-z-change"), prev = timers.get(el);
+    const name = el.getAttribute("z-change"), prev = timers.get(el);
     if (prev) clearTimeout(prev);
-    timers.set(el, setTimeout(() => { // data-z-change: send on change, debounced 100 ms
+    timers.set(el, setTimeout(() => { // z-change: send on change, debounced 100 ms
       timers.delete(el);
       sendEvent(name, payloadOf(el), el);
     }, CHANGE_MS));
   }
 
   function upload(input) {
-    const name = input.getAttribute("data-z-upload"), files = input.files;
+    const name = input.getAttribute("z-upload"), files = input.files;
     if (!name || !files || !files.length) return;
-    const body = new FormData(), field = input.name || attr(input, "data-z-val") || "file";
+    const body = new FormData(), field = input.name || attr(input, "z-val") || "file";
     let total = 0, sent = 0;
     for (const f of files) { body.append(field, f, f.name); total += f.size; }
     // XHR, not fetch: upload progress is only observable through XHR progress events.
@@ -339,7 +339,7 @@
     if (msg.focus && typeof msg.focus === "object") { const t = q(document.body, msg.focus.id); if (t && t.focus) t.focus(); }
     if (msg.nav && typeof msg.nav.url === "string") try { history.pushState(null, "", msg.nav.url); } catch (e) {}
     send({ t: "ack", rev: cfg.rev });
-    if (beacon || (beacon = !!document.querySelector("[data-z-beacon]"))) {
+    if (beacon || (beacon = !!document.querySelector("[z-beacon]"))) {
       send({ t: "beacon", phase: "paint", at: at }); // dev-only paint beacon (dev.md §Development loop)
     }
   }
@@ -430,14 +430,14 @@
 
   function readConfig(options) {
     const opts = options && typeof options === "object" ? options : {};
-    const meta = one(document, "[data-z-live-config]"), raw = meta && (meta.getAttribute("content") || attr(meta, "data-z-live-config"));
+    const meta = one(document, "[z-live-config]"), raw = meta && (meta.getAttribute("content") || attr(meta, "z-live-config"));
     let blob = null;
-    if (raw) { try { blob = JSON.parse(raw); } catch (e) { warn("bad data-z-live-config JSON:", e && e.message); } }
+    if (raw) { try { blob = JSON.parse(raw); } catch (e) { warn("bad z-live-config JSON:", e && e.message); } }
     const sources = [meta, document.documentElement, document.body].filter(Boolean);
     const first = (...vals) => { for (const v of vals) if (v != null) return v; return null; };
     // options beat page attributes, which beat the meta-tag JSON blob
     const pick = (key, name) => first(opts[key], ...sources.map((el) => el.getAttribute(name)), blob && blob[key]);
-    const token = pick("token", "data-z-token"), ws = pick("ws", "data-z-ws"), wt = pick("wt", "data-z-wt"), rev = Number(pick("rev", "data-z-rev") || 0);
+    const token = pick("token", "z-token"), ws = pick("ws", "z-ws"), wt = pick("wt", "z-wt"), rev = Number(pick("rev", "z-rev") || 0);
     cfg.token = token == null ? null : String(token);
     // Endpoint precedence: an explicit WebTransport URL, then an explicit WebSocket URL (that
     // endpoint selects the fallback transport), then the page's own origin as the WebTransport

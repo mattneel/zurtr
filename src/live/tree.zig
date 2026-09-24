@@ -2,7 +2,7 @@
 //!
 //! One tree type serves both the initial HTML render and every later patch:
 //! the server renders a view into a `Tree` with a `Builder`, ships the HTML of
-//! the root (which carries `data-z="<id>"` on every element), keeps the tree,
+//! the root (which carries `z-id="<id>"` on every element), keeps the tree,
 //! and diffs the next render against it (`patch.zig`).
 //!
 //! Invariants:
@@ -10,8 +10,8 @@
 //! * Every node has an id equal to its index in the tree's node list, so
 //!   `node(id).id == id`. Ids are the patch addressing scheme and are stable
 //!   for as long as the tree lives.
-//! * Every `element` emits `data-z="<its own id>"` in addition to its user
-//!   attributes; `fragment` emits only its children and never a `data-z`;
+//! * Every `element` emits `z-id="<its own id>"` in addition to its user
+//!   attributes; `fragment` emits only its children and never a `z-id`;
 //!   `raw` emits its bytes verbatim; `text` emits escaped text.
 //! * Strings are interned per tree; the empty string is id 0 and is never
 //!   stored. All tree memory (nodes, string bytes, children/attr slices, the
@@ -181,7 +181,7 @@ pub const Tree = struct {
                     try writeAttrEscaped(w, self.str(a.value));
                     try w.writeByte('"');
                 }
-                try w.writeAll(" data-z=\"");
+                try w.writeAll(" z-id=\"");
                 try w.print("{d}", .{n.id});
                 try w.writeByte('"');
                 try w.writeByte('>');
@@ -335,7 +335,7 @@ fn render(gpa: std.mem.Allocator, t: *const Tree, root: NodeId) ![]u8 {
     return t.writeHtmlAlloc(gpa, root);
 }
 
-test "html: golden element, text escaping and data-z ids" {
+test "html: golden element, text escaping and z-id ids" {
     var t = Tree.init(testing.allocator);
     defer t.deinit();
     var b = Builder.init(&t);
@@ -350,7 +350,7 @@ test "html: golden element, text escaping and data-z ids" {
 
     const html = try render(testing.allocator, &t, b.root());
     defer testing.allocator.free(html);
-    try testing.expectEqualStrings("<div class=\"box\" data-z=\"1\">hi &amp; &lt;bye&gt;</div>", html);
+    try testing.expectEqualStrings("<div class=\"box\" z-id=\"1\">hi &amp; &lt;bye&gt;</div>", html);
 }
 
 test "html: attribute escaping, omitted attributes and ordering" {
@@ -369,7 +369,7 @@ test "html: attribute escaping, omitted attributes and ordering" {
     const html = try render(testing.allocator, &t, b.root());
     defer testing.allocator.free(html);
     try testing.expectEqualStrings(
-        "<a href=\"/x?a=1&amp;b=2\" title=\"a&quot;b&lt;c>d\" data-n=\"3\" data-z=\"1\"></a>",
+        "<a href=\"/x?a=1&amp;b=2\" title=\"a&quot;b&lt;c>d\" data-n=\"3\" z-id=\"1\"></a>",
         html,
     );
 }
@@ -394,7 +394,7 @@ test "html: void elements emit no closing tag" {
     const html = try render(testing.allocator, &t, b.root());
     defer testing.allocator.free(html);
     try testing.expectEqualStrings(
-        "<img src=\"a.png\" data-z=\"1\"><br data-z=\"2\"><div data-z=\"3\"></div>",
+        "<img src=\"a.png\" z-id=\"1\"><br z-id=\"2\"><div z-id=\"3\"></div>",
         html,
     );
 }
@@ -414,7 +414,7 @@ test "html: raw passes through verbatim, fragment has no wrapper" {
 
     const html = try render(testing.allocator, &t, b.root());
     defer testing.allocator.free(html);
-    try testing.expectEqualStrings("<b>x</b>&amp;t&lt;<span data-z=\"4\">s</span>", html);
+    try testing.expectEqualStrings("<b>x</b>&amp;t&lt;<span z-id=\"4\">s</span>", html);
 
     // The fragment is a node with identity, but contributes no markup and no id.
     const frag = t.node(2);
@@ -448,7 +448,7 @@ test "html: ids are assigned in creation order and serialize deterministically" 
     defer testing.allocator.free(html_b);
     try testing.expectEqualStrings(html_a, html_b);
     try testing.expectEqualStrings(
-        "<ul data-z=\"1\"><li data-z=\"2\">one</li><li data-z=\"4\">two</li></ul>",
+        "<ul z-id=\"1\"><li z-id=\"2\">one</li><li z-id=\"4\">two</li></ul>",
         html_a,
     );
 
@@ -487,7 +487,7 @@ test "builder: unclosed nodes are closed by deinit; stray close is an error" {
 
     const html = try render(testing.allocator, &t, 0);
     defer testing.allocator.free(html);
-    try testing.expectEqualStrings("<div data-z=\"1\">x</div>", html);
+    try testing.expectEqualStrings("<div z-id=\"1\">x</div>", html);
 }
 
 test "builder: element after the root is closed is an error" {

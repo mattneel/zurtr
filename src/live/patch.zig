@@ -1298,8 +1298,8 @@ test "json: every op kind encodes to the wire format" {
         "[{\"op\":\"text\",\"id\":4,\"value\":\"a\\\"b\\\\c\\n\\u0007\"}" ++
         ",{\"op\":\"attr\",\"id\":4,\"name\":\"class\",\"value\":\"x y\"}" ++
         ",{\"op\":\"attr\",\"id\":4,\"name\":\"gone\",\"value\":null}" ++
-        ",{\"op\":\"replace\",\"id\":2,\"html\":\"<div data-z=\\\"1\\\">hi</div>\"}" ++
-        ",{\"op\":\"insert\",\"parent\":1,\"index\":2,\"html\":\"<div data-z=\\\"1\\\">hi</div>\"}" ++
+        ",{\"op\":\"replace\",\"id\":2,\"html\":\"<div z-id=\\\"1\\\">hi</div>\"}" ++
+        ",{\"op\":\"insert\",\"parent\":1,\"index\":2,\"html\":\"<div z-id=\\\"1\\\">hi</div>\"}" ++
         ",{\"op\":\"remove\",\"id\":9}" ++
         ",{\"op\":\"move\",\"id\":5,\"parent\":1,\"index\":0}]";
     try testing.expectEqualStrings(expected, json);
@@ -1327,7 +1327,7 @@ test "json: html values are escaped correctly across writer buffer flushes" {
     const json = try writeJsonAlloc(testing.allocator, &next, &ops);
     defer testing.allocator.free(json);
 
-    const prefix = "[{\"op\":\"replace\",\"id\":0,\"html\":\"<div title=\\\"a&quot;b&lt;c\\\" data-z=\\\"1\\\">t";
+    const prefix = "[{\"op\":\"replace\",\"id\":0,\"html\":\"<div title=\\\"a&quot;b&lt;c\\\" z-id=\\\"1\\\">t";
     const suffix = "</div>\"}]";
     try testing.expectEqualStrings(prefix, json[0..prefix.len]);
     try testing.expectEqualStrings(suffix, json[json.len - suffix.len ..]);
