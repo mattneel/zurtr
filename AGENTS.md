@@ -215,6 +215,19 @@ import it.
 
 ## Directions already decided
 
+- **The UI layer is branded LiveViewZ** — LiveView names the contract, Z names the family. The
+  reference is Phoenix LiveView: server-owned state, a tree as the view, changes arriving as patches,
+  events travelling up, `JS.*` for immediate browser changes and server events for business effects,
+  and the hook contract (stable ids, `phx-update="ignore"` for client-owned input, explicit
+  browser→server events). The patch stream and the hook contract are what "LiveView" means here; the
+  renderer is not part of the name.
+- **Keep a fidelity ledger, as `pi.zig` does.** It calls itself *"an independent, parity-focused Zig
+  implementation"* and carries a `docs/porting-guide.md` with a ledger of what matches upstream, what
+  diverges, and why. LiveViewZ wants the same: the divergences are the interesting part, and writing
+  them down is what stops "that's not how LiveView does it" becoming relearned knowledge. A second
+  client — the Yoga/native one below — is what turns the patch format from an implementation detail
+  into a contract, and the ledger is how that claim stays honest.
+
 - **`zdl` is the data layer's future**, not a competitor to the Turso adapter: `zdl` for local
   storage, the wire format and codegen; Turso for the SQL/sync tier. Its Phase 5 (CRDTs, diffs,
   vector clocks) is the sync substrate.
