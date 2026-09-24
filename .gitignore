@@ -16,3 +16,6 @@ Thumbs.db
 .zig-cache/
 zig-out/
 zig-pkg/
+
+# mdBook's build output
+book/

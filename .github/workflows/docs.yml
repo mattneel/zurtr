@@ -1,0 +1,58 @@
+name: Docs
+
+on:
+  push:
+    branches: [master]
+    # Rebuild when the sources change, not on every commit: the book is derived from these files
+    # and a code-only push cannot change it.
+    paths:
+      - "docs/**"
+      - "book.toml"
+      - "README.md"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Only the deploy job needs these, and it needs all three: `pages: write` to publish, `id-token`
+# for the OIDC handshake the Pages action uses instead of a stored token.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and never cancel one in flight. A half-published book is worse than a
+# stale one, because nothing about the result says it is half.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the version the book is developed against. mdBook's output is stable enough that
+      # this rarely matters and different enough when it does that "it built on my machine" would
+      # otherwise be the whole story.
+      - name: Install mdBook
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.3/mdbook-v0.5.3-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin
+          mdbook --version
+
+      - name: Build the book
+        run: mdbook build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

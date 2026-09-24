@@ -1,0 +1,17 @@
+[book]
+title = "zurtr"
+authors = ["mattneel"]
+description = "A native application framework in Zig, built on the vendored zix transport."
+src = "docs"
+language = "en"
+
+[output.html]
+# The default theme. A framework whose docs need a custom theme is a framework with a different
+# problem, and every line of configuration here is a line that has to keep working.
+default-theme = "navy"
+git-repository-url = "https://github.com/mattneel/zurtr"
+edit-url-template = "https://github.com/mattneel/zurtr/edit/master/{path}"
+
+[output.html.search]
+# The thing a folder of markdown cannot do: find the sentence that answers the question.
+enable = true
