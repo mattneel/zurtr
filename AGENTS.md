@@ -25,6 +25,17 @@ conversation. Check first; the answer is usually already built and better.
 - **`~/src/zix`** — the transport, vendored here at `deps/zix`.
 - Everything this tree depends on is **vendored at `deps/` with an `UPSTREAM.md`**. Nothing is
   fetched, so `zig build` works offline and a dependency cannot change under a user.
+- **Smoke-testing a model call:** four routes are available, two of them flat-rate. Prefer the
+  subscription-backed ones for anything repetitive.
+  - **Codex CLI** for OpenAI coding models and **Claude Code** for Anthropic models — both on Max
+    subscriptions, so no metered cost. `~/src/quire` already wraps the Codex app-server in Elixir if
+    a reference for driving it is useful.
+  - **DeepSeek direct** (`https://api.deepseek.com`) and **OpenRouter** — metered, approved for spend.
+  - Model routing, base URLs and per-model quirks live in `~/.omp/agent/models.yml`, which is worth
+    reading before describing any provider: it already has the exact compat flags each one needs
+    (reasoning effort mapping, `max_tokens` versus `max_completion_tokens`, tool-choice support).
+- Keys live in `~/src/rctr/.env` (mode `600`, gitignored) or in the agent config above. **Never copy a
+  credential into this tree**, and never print one into a report.
 
 **Almost every layer zurtr integrates already exists as a sibling.** `gh repo list mattneel` is
 one call and lists them all; do that before designing anything, and before spawning an agent to go
