@@ -111,6 +111,7 @@ they fail as *wrong behaviour* rather than compile errors.
 |---|---|
 | `[_]T{x} ** N` | **parse error** — a whitespace-symmetry rule, so it fires merely by loading the file. Rewrite as `@splat(x)`, which removes the question; add an explicit array type when the result location doesn't provide one. |
 | `std.meta.fields(T)` | **hard `@compileError`**. Use `@typeInfo(T).@"struct"` and zip `field_names` / `field_types` / `field_attrs`. |
+| `@typeInfo(T).@"enum".fields` | also columnar now — the field is **`field_names`** (with `field_values` and `decl_names` beside it), and `lang.Type.Enum` is documented as kept in sync with the compiler, so read it rather than guessing. Hit in `zglfw`, `zdl` and `zpool`. |
 | `std.builtin.Type.StructField` | **gone.** Any signature taking a field descriptor must take something else — a `Column` enum, a name, an index. |
 | `@hasDecl` | **only reports *public* declarations now.** Silent: it compiles and fails at runtime, so a test fixture's private hook needs `pub`. This one cost nine failing tests in `zpool`; expect the same in anything that dispatches on declarations. |
 | `std.meta.declarations()` | returns *names* (`[]const [:0]const u8`), not field descriptors. |
