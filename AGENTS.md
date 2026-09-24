@@ -25,15 +25,19 @@ conversation. Check first; the answer is usually already built and better.
 - **`~/src/zix`** — the transport, vendored here at `deps/zix`.
 - Everything this tree depends on is **vendored at `deps/` with an `UPSTREAM.md`**. Nothing is
   fetched, so `zig build` works offline and a dependency cannot change under a user.
-- **Smoke-testing a model call:** four routes are available, two of them flat-rate. Prefer the
-  subscription-backed ones for anything repetitive.
-  - **Codex CLI** for OpenAI coding models and **Claude Code** for Anthropic models — both on Max
-    subscriptions, so no metered cost. `~/src/quire` already wraps the Codex app-server in Elixir if
-    a reference for driving it is useful.
-  - **DeepSeek direct** (`https://api.deepseek.com`) and **OpenRouter** — metered, approved for spend.
-  - Model routing, base URLs and per-model quirks live in `~/.omp/agent/models.yml`, which is worth
-    reading before describing any provider: it already has the exact compat flags each one needs
-    (reasoning effort mapping, `max_tokens` versus `max_completion_tokens`, tool-choice support).
+- **Smoke-testing a model call:** three routes, cheapest first. Prefer the early ones for anything
+  repetitive, and treat the last as a last resort.
+  1. **Codex CLI** for OpenAI coding models and **Claude Code** for Anthropic models — Max
+     subscriptions, so no metered cost. `~/src/quire` wraps the Codex app-server if a reference for
+     driving it is useful.
+  2. **DeepSeek direct** (`deepseek-v4-flash`, `deepseek-v4-pro`) and **OpenRouter** — metered and
+     cheap, approved for spend.
+  3. **OpenAI and Anthropic APIs directly** — enterprise pricing. Only in tiny doses, on the small
+     models (the Luna class and the latest Haiku).
+  `~/.omp/agent/models.yml` is the authority on model ids, base URLs and per-model quirks, and it is
+  worth reading before describing any provider: it already carries the exact compat flags each needs —
+  reasoning-effort mapping, `max_tokens` versus `max_completion_tokens`, tool-choice support,
+  developer-role support. Guessing those from memory wastes calls.
 - Keys live in `~/src/rctr/.env` (mode `600`, gitignored) or in the agent config above. **Never copy a
   credential into this tree**, and never print one into a report.
 
