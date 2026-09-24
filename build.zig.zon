@@ -44,6 +44,11 @@
         // The script engine, vendored at deps/quickjs-ng (see its UPSTREAM.md). Its QuickJS C sources
         // are a package dependency of the binding, so nothing is fetched unless -Dscript asks for it.
         .quickjs_ng = .{ .path = "deps/quickjs-ng" },
+        // The GPU layer, vendored at deps/zgpu (see its UPSTREAM.md). Gives a native zurtr
+        // application WebGPU through Dawn - but Dawn is not built here: `libs/` is its headers and
+        // the native libraries arrive as prebuilt archives, one pinned tarball per target, fetched
+        // when a build actually reaches zgpu. Vendoring Dawn's source instead would be ~60 Chromium
+        // sub-repositories (541 MB, 492k lines of C++) for no gain at this layer.
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
