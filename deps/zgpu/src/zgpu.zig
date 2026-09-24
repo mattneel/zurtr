@@ -1813,7 +1813,7 @@ fn logUnhandledError(
     }
 
     // Exit the process for easier debugging.
-    if (@import("builtin").mode == .Debug)
+    if (@import("builtin").mode == .debug)
         std.process.exit(1);
 }
 

@@ -1,0 +1,25 @@
+.{
+    .name = .hello_gpu,
+    .version = "0.0.0",
+    .fingerprint = 0x605daef5a1afa62c,
+    .minimum_zig_version = "0.17.0-dev.2264+230c63650",
+    .dependencies = .{
+        // Both live in zurtr's own vendored tree, so this example needs no network and cannot drift
+        // from the versions the framework ships.
+        .zgpu = .{ .path = "../../deps/zgpu" },
+        .zglfw = .{ .path = "../../deps/zglfw" },
+        // zgpu's prebuilt Dawn arrives as a lazy dependency of *this* package, not of zgpu: its
+        // addLibraryPathsTo resolves through the consuming build graph. Same URL and hash as
+        // deps/zgpu/build.zig.zon pins; lazy, so nothing is fetched unless a build reaches it.
+        .dawn_x86_64_linux_gnu = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-linux-gnu/archive/7d70db023bf254546024629cbec5ee6113e12a42.tar.gz",
+            .hash = "N-V-__8AAK7XUQNKNRnv1J6i189jtURJKjp3HTftoyD4Y4CB",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}
