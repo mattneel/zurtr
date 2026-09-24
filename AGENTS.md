@@ -23,11 +23,29 @@ conversation. Check first; the answer is usually already built and better.
   key agreement, read it before writing anything — `std.crypto` ships `ml_dsa`, `ml_kem` and
   `hybrid_kem`, and this project has already decided how to use them.
 - **`~/src/zix`** — the transport, vendored here at `deps/zix`.
-- **The rest of `~/src` is not yet catalogued.** There are roughly sixty checkouts and several are
-  the user's own; treat the three above as known anchors and look for a fourth before designing
-  something that may already exist.
 - Everything this tree depends on is **vendored at `deps/` with an `UPSTREAM.md`**. Nothing is
   fetched, so `zig build` works offline and a dependency cannot change under a user.
+
+**Almost every layer zurtr integrates already exists as a sibling.** `gh repo list mattneel` is
+one call and lists them all; do that before designing anything, and before spawning an agent to go
+read sixty directories.
+
+| zurtr's layer | the sibling that already does it |
+|---|---|
+| transport | **`zix`** — vendored at `deps/zix` |
+| data, schema, migrations, codegen | **`zdl`** — Zero Data Layer |
+| crypto, secrets, identity, signing | **`zault`** — ML-KEM-768, ML-DSA-65, zero-knowledge |
+| the JavaScript sandbox (`zscript`) | **`zig-quickjs-ng`** — Zig build and bindings for quickjs-ng |
+| agents, models, tool calling | **`ai.zig`**, **`pi.zig`** ("Pi agent semantics. Zig runtime. One binary."), **`jzs`** ("next generation agent substrate") |
+| actors, exactly | **`zacto`** |
+| simulation, determinism, forking | **`gkz`** — "a deterministic, fully observable, forkable simulation kernel in Zig", with its own authoring skill |
+| WASM translation | **`fizh`** |
+| terminal rendering (`zeex` is a TUI) | **`tuizr`**, **`opentui`** |
+| the SQL tier | **`turso.zig`** — ownership-safe bindings for Turso's C ABI, which is what the `data` contract is written against |
+| build and release automation | **`setup-anyzig`**, `scaffold` |
+
+Known and already read: `zix`, `zdl`, `zault`, `paydaemon`, `gkz`. The rest of the table is from
+repository descriptions, not from reading them — check the source before relying on a detail.
 
 ## Structure
 
