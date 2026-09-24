@@ -227,11 +227,12 @@ is therefore a deployment choice (role processes, or one process per shard).
   and ZEEX's compiler and the live editor both reach up from below the root.
 - Tests are per-module steps rather than one binary, so a failure names the
   module it is in: `test-zurtr` (the framework root), `test-zix` (the vendored
-  transport), `test-cli` (the generator and its template engine), `test-data` /
-  `test-data-nodes` (with `-Dturso`), `test-zscript`, `test-zeex` and
-  `test-zeex-live` (with `-Dzscript`), and a `test` aggregate that runs whatever
-  the build enabled. A test that needs a binding is compiled only when there is
-  one — `src/jobs/root.zig` pulls in its database-backed tests behind
+  transport), `test-cli` (the generator — whose tests name `templ` explicitly,
+  because an imported file's tests are only analysed when something names it),
+  `test-data` / `test-data-nodes` (with `-Dturso`), `test-zscript`, `test-zeex`
+  and `test-zeex-live` (with `-Dzscript`), and a `test` aggregate that runs
+  whatever the build enabled. A test that needs a binding is compiled only when
+  there is one — `src/jobs/root.zig` pulls in its database-backed tests behind
   `if (comptime @import("build_options").turso)`, so the same tree tests the
   queue's logic without the adapter and its storage with it.
 - Build options are the framework's own and all default off: `-Dturso` /
