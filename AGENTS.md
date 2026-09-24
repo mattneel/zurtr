@@ -103,7 +103,15 @@ Two consequences for writing code here. **The library is the interface** — `gk
 contract**: zurtr's `docs/modules/` contracts are prose, where `zacto` maps clause to test and `gkz`
 numbers its determinism rules. Match that when a module's behaviour is what matters.
 
-**Porting a dependency to 0.17.** Four trees have now gone through it — `zdl`, `zgpu`, `zpool`, and
+**The toolchain is Zig++, not upstream Zig.** The pinned compiler serves
+`0.17.0-dev.2264+230c63650`, which does **not** exist on ziglang.org — searching for it there
+returns 404, and the conclusion that the pin is broken is the wrong one. It comes from
+`mattneel/zigpp`, a fork that changes `std.lang.Type`; its README states plainly that upstream Zig
+binaries can no longer build it. So when a compiler error here looks like an upstream version
+change, it may be *this fork's* change instead: read `~/src/zig/zig` before theorising, and do not
+assume a fix that works against released Zig will apply.
+
+**Porting a dependency.** Four trees have now gone through it — `zdl`, `zgpu`, `zpool`, and
 `deps/quickjs-ng` before them. The mechanical breaks are quick; the two semantic ones are not, and
 they fail as *wrong behaviour* rather than compile errors.
 
