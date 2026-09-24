@@ -55,6 +55,14 @@
         // function pointers and an opaque window handle - so this is the other half of a native GPU
         // application. Like zgpu, it is inert until a build actually reaches it.
         .zglfw = .{ .path = "deps/zglfw" },
+        // The layout layer, vendored at deps/yoga (see its UPSTREAM.md). Yoga, the embeddable
+        // Flexbox engine, as the 19 C++ translation units its own CMakeLists globs out of `yoga/`,
+        // with upstream's C headers on top of them: zgpu draws rects, and this is what decides
+        // where the rects go. It is the one dependency here that is neither a Zig package nor a
+        // fetched archive - it is C++ source with a C API, built by deps/yoga/build.zig because
+        // upstream has no build but CMake. Dependency-free by design, so vendoring it as source
+        // costs 620 KB and no package manager at build time.
+        .yoga = .{ .path = "deps/yoga" },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding

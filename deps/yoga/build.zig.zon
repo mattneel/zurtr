@@ -1,0 +1,21 @@
+.{
+    .name = .yoga,
+    // Upstream's own version fields are the placeholder `0.0.0` (gradle.properties `VERSION_NAME`,
+    // the JS package, and this revision's `Package.swift` all say so) and are stamped at release
+    // time by `set-version.py`, so the pin that identifies this tree is the revision in UPSTREAM.md
+    // — not a version, and not one invented here.
+    .version = "0.0.0",
+    .fingerprint = 0x64f110b9920c7668, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.2264+230c63650",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        // The library: headers and translation units, only the ones upstream's CMake lists.
+        "yoga",
+        // The smoke programs, so a fetched copy of this package can still prove itself with
+        // `zig build smoke` rather than only compiling.
+        "smoke",
+        "UPSTREAM.md",
+        "LICENSE",
+    },
+}
