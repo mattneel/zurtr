@@ -19,3 +19,6 @@ zig-pkg/
 
 # mdBook's build output
 book/
+
+# The client library's toolchain
+client/node_modules/

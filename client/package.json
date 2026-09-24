@@ -1,0 +1,13 @@
+{
+  "name": "zurtr-live-client",
+  "private": true,
+  "type": "module",
+  "description": "The browser half of the Live UI: DOM patching, the event protocol, and the transport.",
+  "scripts": {
+    "build": "tsdown -c tsdown.config.ts",
+    "watch": "tsdown -c tsdown.config.ts --watch"
+  },
+  "devDependencies": {
+    "tsdown": "^0.23.0"
+  }
+}
