@@ -103,6 +103,27 @@ Two consequences for writing code here. **The library is the interface** — `gk
 contract**: zurtr's `docs/modules/` contracts are prose, where `zacto` maps clause to test and `gkz`
 numbers its determinism rules. Match that when a module's behaviour is what matters.
 
+**Porting a dependency to 0.17.** Four trees have now gone through it — `zdl`, `zgpu`, `zpool`, and
+`deps/quickjs-ng` before them. The mechanical breaks are quick; the two semantic ones are not, and
+they fail as *wrong behaviour* rather than compile errors.
+
+| what | 0.17 shape |
+|---|---|
+| `[_]T{x} ** N` | **parse error** — a whitespace-symmetry rule, so it fires merely by loading the file. Rewrite as `@splat(x)`, which removes the question; add an explicit array type when the result location doesn't provide one. |
+| `std.meta.fields(T)` | **hard `@compileError`**. Use `@typeInfo(T).@"struct"` and zip `field_names` / `field_types` / `field_attrs`. |
+| `std.builtin.Type.StructField` | **gone.** Any signature taking a field descriptor must take something else — a `Column` enum, a name, an index. |
+| `@hasDecl` | **only reports *public* declarations now.** Silent: it compiles and fails at runtime, so a test fixture's private hook needs `pub`. This one cost nine failing tests in `zpool`; expect the same in anything that dispatches on declarations. |
+| `std.meta.declarations()` | returns *names* (`[]const [:0]const u8`), not field descriptors. |
+| `@cImport` | **removed.** A `translate-c` step over the header produces a module to `@import`. |
+| `std.meta.intToEnum` | gone → `std.enums.fromInt(...) orelse ...`, which returns an optional, not an error union. |
+| `std.meta.Int` | gone → `@Int(.unsigned, bits)`. |
+| `Fn.params` | → `param_types`. |
+| `field.defaultValue()` | → `attrs.defaultValue(FieldType)`. |
+| `std.hash.crc.Crc32` | renamed in the regenerated CRC catalog. |
+
+When porting a vendored dependency, **check the source for these before debugging the errors** — and
+after it compiles, run its own test suite, because the `@hasDecl` class will not announce itself.
+
 ## Structure
 
 - `src/<module>/` — one directory per module, each with a `root.zig`; `src/root.zig` is the
