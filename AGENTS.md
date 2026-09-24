@@ -47,6 +47,28 @@ read sixty directories.
 Known and already read: `zix`, `zdl`, `zault`, `paydaemon`, `gkz`. The rest of the table is from
 repository descriptions, not from reading them — check the source before relying on a detail.
 
+**The Elixir side is the same architecture, already shipped.** `entwurfswerk` and `paydaemon` are
+both Phoenix applications where durable state goes through Ash actions and events reach the browser
+over Phoenix Channels; their conventions are the ones zurtr is converging on.
+
+| zurtr's layer | the Elixir sibling that already ships it |
+|---|---|
+| `domain` — typed actions, policy, validation | **Ash**, via `paydaemon` and `entwurfswerk`: *"every durable change goes through an Ash action"* |
+| `signals` | **Jido** — `entwurfswerk`: *"Jido Signal Bus carries internal events; Phoenix Channels carry them to the browser"* |
+| `live` | **Phoenix LiveView** (`paydaemon` for the hook contract and the `JS.*` / server-event split) |
+| `zscript` — the JavaScript tier | **`quickjs_ex`** — QuickJS-NG embedded through Zig NIFs, with its ownership rules written down |
+| local storage and vector search | **`ex_lancedb`** — embedded LanceDB via Rustler, *"without a sidecar service"* |
+| one static executable | **Burrito** and ExTauri, as `entwurfswerk` builds it |
+| agent providers and browser actions | **`req_llm`** and **`jido_browser`**, both under the Jido organisation |
+
+**`quickjs_ex` is the honest documentation of the JavaScript tier**, and two of its lines are
+corrections to assumptions worth not repeating: *"It is not an OS sandbox; do not treat it as
+isolation for adversarial JavaScript without an outer process, container, VM, or similar boundary"*,
+and gas accounting *"measure[s] JavaScript execution time, not time parked on a host callback"*. Its
+context model — one dedicated OS thread per `JSRuntime`, calls enqueued to that thread, a
+`:not_owner` error from any other process, `:context_busy` on re-entry, and retained handles
+*poisoned* when the owning process dies — is the semantics `zscript` should implement.
+
 ## Structure
 
 - `src/<module>/` — one directory per module, each with a `root.zig`; `src/root.zig` is the
@@ -130,9 +152,11 @@ import it.
 - **`zdl` is the data layer's future**, not a competitor to the Turso adapter: `zdl` for local
   storage, the wire format and codegen; Turso for the SQL/sync tier. Its Phase 5 (CRDTs, diffs,
   vector clocks) is the sync substrate.
-- **The client has three tiers**, and only one of them is sandboxed: commands and generated
-  functions are plain JS on the fast path; **untrusted scripts only** run in the QuickJS wasm
-  engine, which is therefore loaded conditionally.
+- **The client has three tiers**, and only one of them runs code the application did not write:
+  commands and generated functions are plain JS on the fast path; untrusted scripts run in the
+  QuickJS engine, which is why it is loaded conditionally. **That engine is not an OS sandbox** —
+  `quickjs_ex` says so plainly, and treating it as isolation for adversarial JavaScript needs an
+  outer process, container or VM on top of it.
 - **Navigation over the live channel** — the patch stream survives a page change, which is what
   Turbo cannot do.
 - **Multiple streams at mixed rates** — a topic per lane, datagrams for feeds where losing a tick
