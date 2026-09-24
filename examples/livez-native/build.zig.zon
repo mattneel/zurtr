@@ -1,0 +1,39 @@
+.{
+    .name = .livez_native,
+    .version = "0.0.0",
+    .fingerprint = 0x9f0d67dd1088496,
+    .minimum_zig_version = "0.17.0-dev.2264+230c63650",
+    .dependencies = .{
+        // All three live in zurtr's own vendored tree, so this example needs no network and cannot
+        // drift from the versions the framework ships. The live UI sources themselves are not a
+        // dependency: they are reached through `vendor/live`, a symlink into `src/live` (see the note
+        // at the top of main.zig), because Zig will not let a module import a file that lives outside
+        // its own root directory.
+        .zgpu = .{ .path = "../../deps/zgpu" },
+        .zglfw = .{ .path = "../../deps/zglfw" },
+        .yoga = .{ .path = "../../deps/yoga" },
+        // zgpu's prebuilt Dawn arrives as a lazy dependency of *this* package, not of zgpu: its
+        // addLibraryPathsTo resolves through the consuming build graph. Same URL and hash as
+        // deps/zgpu/build.zig.zon pins; lazy, so nothing is fetched unless a build reaches it.
+        // The Linux prebuilt is the one this example runs against (WSL2, Vulkan through Mesa).
+        .dawn_x86_64_linux_gnu = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-linux-gnu/archive/7d70db023bf254546024629cbec5ee6113e12a42.tar.gz",
+            .hash = "N-V-__8AAK7XUQNKNRnv1J6i189jtURJKjp3HTftoyD4Y4CB",
+            .lazy = true,
+        },
+        // The Windows prebuilt, so this example can also be cross-compiled from WSL and run through
+        // interop against real D3D12/Vulkan drivers rather than Mesa's dzn translation layer.
+        .dawn_x86_64_windows_gnu = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-windows-gnu/archive/d3a68014e6b6b53fd330a0ccba99e4dcfffddae5.tar.gz",
+            .hash = "N-V-__8AAGsYnAT5RIzeAu881RveLghQ1EidqgVBVx10gVTo",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        // The symlink to `src/live`, so a fetched copy of this example is still self-describing.
+        "vendor",
+    },
+}
