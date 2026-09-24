@@ -69,6 +69,25 @@ context model — one dedicated OS thread per `JSRuntime`, calls enqueued to tha
 `:not_owner` error from any other process, `:context_busy` on re-entry, and retained handles
 *poisoned* when the owning process dies — is the semantics `zscript` should implement.
 
+**These are kernels, and the pattern is consistent.** `gkz`, `zacto` and zurtr are the same species:
+a pure step function over a value, with determinism as a contract rather than a hope.
+
+- `gkz`: `step : (State, Input) -> State`, where `State` is *"serializable, content-hashable,
+  diffable"* — so *"record/replay, time-travel, forks and divergence detection are corollaries, not
+  separate features."* Its lineage is named: TigerBeetle, Elm/Redux, rr. Its determinism rules
+  (D1–D9) include *no floating point on any sim path* (integers, or `fpz` fixed point), *no clock,
+  no syscall, no ambient RNG inside `step`* — randomness is a keyed pure function, not a cursor —
+  and *no pointers in hashed state*. Rendering is a one-way view seam that reads snapshots.
+- `zacto`: `turn : (State, Envelope) -> (State', Effects) | Error`, effects executed only after the
+  turn commits, so a failed turn has neither effects nor state change. `SPEC.md` is 52 numbered
+  clauses, each mapped to its conformance test, with provenance in an appendix and the roadmap
+  labelled `NOT NORMATIVE`.
+
+Two consequences for writing code here. **The library is the interface** — `gkz` says it directly:
+*"an agent that can write and run code does not need a remote-control surface."* And **prove the
+contract**: zurtr's `docs/modules/` contracts are prose, where `zacto` maps clause to test and `gkz`
+numbers its determinism rules. Match that when a module's behaviour is what matters.
+
 ## Structure
 
 - `src/<module>/` — one directory per module, each with a `root.zig`; `src/root.zig` is the
