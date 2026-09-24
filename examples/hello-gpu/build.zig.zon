@@ -11,6 +11,13 @@
         // zgpu's prebuilt Dawn arrives as a lazy dependency of *this* package, not of zgpu: its
         // addLibraryPathsTo resolves through the consuming build graph. Same URL and hash as
         // deps/zgpu/build.zig.zon pins; lazy, so nothing is fetched unless a build reaches it.
+        // The Windows prebuilt, so this example can also be cross-compiled from WSL and run through
+        // interop against real D3D12/Vulkan drivers rather than Mesa's dzn translation layer.
+        .dawn_x86_64_windows_gnu = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-windows-gnu/archive/d3a68014e6b6b53fd330a0ccba99e4dcfffddae5.tar.gz",
+            .hash = "N-V-__8AAGsYnAT5RIzeAu881RveLghQ1EidqgVBVx10gVTo",
+            .lazy = true,
+        },
         .dawn_x86_64_linux_gnu = .{
             .url = "https://github.com/michal-z/webgpu_dawn-x86_64-linux-gnu/archive/7d70db023bf254546024629cbec5ee6113e12a42.tar.gz",
             .hash = "N-V-__8AAK7XUQNKNRnv1J6i189jtURJKjp3HTftoyD4Y4CB",

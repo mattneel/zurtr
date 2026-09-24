@@ -1636,6 +1636,8 @@ fn isLinuxDesktopLike(tag: std.Target.Os.Tag) bool {
     };
 }
 
+extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+
 fn createSurfaceForWindow(instance: wgpu.Instance, window_provider: WindowProvider) wgpu.Surface {
     const os_tag = @import("builtin").target.os.tag;
 
@@ -1643,7 +1645,9 @@ fn createSurfaceForWindow(instance: wgpu.Instance, window_provider: WindowProvid
         .windows => SurfaceDescriptor{
             .windows_hwnd = .{
                 .label = "basic surface",
-                .hinstance = std.os.windows.kernel32.GetModuleHandleW(null).?,
+                .// Zig 0.17 removed GetModuleHandleW from std.os.windows.kernel32, so the
+                // declaration lives here. Wine and Windows both export it from kernel32.
+                hinstance = GetModuleHandleW(null).?,
                 .hwnd = window_provider.getWin32Window().?,
             },
         },
