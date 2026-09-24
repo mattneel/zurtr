@@ -4,11 +4,14 @@ Normative. Types named here are contracts, not final declarations; the
 semantics are what implementations must satisfy. Zig type names use the
 `zurtr.<module>` namespace (e.g. `zurtr.data.Tx`).
 
-Status: the async lane and the deferred rules in §1 are the design this tree is
-held to; `overview.md` §Execution model records how they map onto zix, and
-`docs/architecture/decisions.md` records the rulings (D1 retires the park class,
-D2 confines deferral to `.ASYNC`). §3's adapter position is stated against the
-tree.
+Status: §1's execution rules and §5's durability rules are the design this tree
+is held to, and parts of both are now code: §1.6 is `zurtr.runtime.task`
+(`src/runtime/task.zig`), and the queue rules in §5 — leases, bounded retries
+with backoff, cancellation as a state transition — are `zurtr.jobs`
+(`src/jobs/`). `overview.md` §Execution model records how the async lane maps
+onto zix, and `docs/architecture/decisions.md` records the rulings (D1 retires
+the park class, D2 confines deferral to `.ASYNC`). §3's adapter position is
+stated against the tree.
 
 ## 1. Execution
 
@@ -30,15 +33,23 @@ third name referred to is retired — `decisions.md` D1). Rules:
    response data: the producer allocates it and transfers ownership, the
    consumer validates the handle before writing and frees what it consumed. A
    dropped handle is counted and ignored; it is never an error path that can
-   crash the worker. Deferral is confined to the `.ASYNC` lane until the
-   transport can wake the loop models (`decisions.md` D2).
+   crash the worker. The runtime's carrier is the substrate rather than the
+   handle: `runtime.Completion` (`src/runtime/pool.zig`) is an opaque request
+   token plus an owned payload, and the fields above are what a session-level
+   consumer derives from that token — none exists yet, because there is no
+   session type (`docs/modules/live.md`). Deferral is confined to the `.ASYNC`
+   lane until the transport can wake the loop models (`decisions.md` D2).
 4. **Ordering.** Per connection, responses are written in completion order;
    the framework never reorders a connection's writes. Per session, event
    processing is serialized by the session owner; asynchronous operations
    complete into the owner's queue and are processed in arrival order.
 5. **No blocking.** Loop-thread code must not perform blocking syscalls, mutex
    waits, or unbounded computation. Anything that can wait runs in the async
-   lane or moves to a worker role.
+   lane or moves to a worker role. Submitting work to the runtime's pool
+   follows the same rule from the caller's side: the pool's intake is bounded
+   per worker, `submit` never waits on whoever is running, and a full intake is
+   `error.QueueFull` returned to the caller — shed, retry, or move the work —
+   rather than a loop thread stalled behind a queue (`src/runtime/pool.zig`).
 6. **Scopes own their tasks.** `zurtr.runtime.task`: a `Scope` owns the tasks
    spawned in it, and `end` cancels and waits for every child before it returns;
    a task's own scope is reaped the same way when its body returns, so nothing
@@ -100,8 +111,17 @@ Rules:
   resource queries carry a policy that is compiled into the SQL predicate
   (declarative policies) or applied as a row-level filter before pagination and
   aggregation. Post-filtering a limited page is a contract violation.
+- **One writer per database.** The built adapter opens every read-write
+  transaction `BEGIN IMMEDIATE` (`connection.begin(.immediate, …)`,
+  `src/data/turso_adapter.zig`), so a read-modify-write pair inside one
+  transaction is atomic without a row lock, which is what the queue's
+  select-then-update claim rests on (`src/jobs/schema.zig`). Across nodes that
+  property comes from the `.distributed` tier's write lease (`data.Lease`,
+  `src/data/root.zig`), not from the statement.
 - Migrations are ordered, versioned, and applied by `zurtr migrate`; each
-  migration runs in a transaction; dev mode applies them on start.
+  migration runs in a transaction; dev mode applies them on start. Both halves
+  are unbuilt: `src/main.zig` has `modules` and `new`, and `src/data/root.zig`
+  has no migration entry point yet (`docs/modules/data.md`, `src/jobs/schema.zig`).
 - Explicit SQL is always available and never rewritten. Resource descriptors
   are an additive query construction layer.
 
@@ -124,12 +144,38 @@ Rules:
 
 - Error taxonomy: `operation` (surface decides), `validation` (pre-execution),
   `authz` (deny), `conflict` (optimistic/unique violation), `unavailable`
-  (dependency down), `internal` (bug; logged with context).
+  (dependency down), `internal` (bug; logged with context). A domain action's
+  result refines these rather than collapsing them: `denied` and `not_found`
+  are separate variants — a denied caller gets `denied` before its payload is
+  even decoded, so the two never leak into each other — and `timeout` is
+  reported apart from `unavailable` (`src/domain/action.zig`).
 - **Jobs are at-least-once.** Workers lease, heartbeat, and may re-deliver after
   lease expiry. Actions used as jobs must be idempotent or carry an
   `idempotency_key` (derived by the caller, unique in the store). Transactional
   writes + unique constraints are the dedup mechanism; there is no
-  exactly-once promise.
+  exactly-once promise. Three consequences the queue is held to, all of them
+  implemented in `src/jobs/`:
+  - **Claim order and queue limits are part of the predicate.** Highest priority
+    first, then earliest due time, then lowest id; a bounded queue counts its
+    live leases inside the same transaction that takes the row, and `-1` is
+    unlimited (`QueueLimit`, `src/jobs/root.zig`). A limit is not something a
+    worker enforces after the fact — a claim that would exceed it takes nothing.
+  - **A lost lease cannot overwrite its successor.** Every claim bumps the row's
+    `attempt`, and every write only an owner may make is guarded on
+    `state = 'leased' AND attempt = ?` in the same statement as the write, so a
+    worker whose lease expired affects zero rows and is told `not_owner` rather
+    than clobbering the attempt that took over (`src/jobs/root.zig`, `Owned`).
+    At-least-once means a job may run twice; it does not mean a run whose lease
+    is gone may write.
+  - **Wake-up is a poll, and a tick fires at most once.** There is no
+    notification channel in the built adapter, so a runner polls at
+    `poll_interval_ms` and only a same-process enqueue can raise an in-process
+    signal — which is why an `enqueue` inside a caller's `Tx` becomes claimable
+    at the caller's commit and not before (`src/jobs/root.zig`). A recurring
+    schedule's job carries a key derived from the schedule id and the tick time,
+    so a crash between enqueue and advancing the schedule cannot double-fire,
+    and ticks that elapsed while no runner was up are skipped rather than
+    replayed — catching up turns an outage into a stampede (`src/jobs/root.zig`).
 - **External effects require recorded results.** An effect that leaves the
   process (HTTP call, email, payment) records its completion result in durable
   storage before the enclosing step commits; recovery replays decisions from
