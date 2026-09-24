@@ -116,6 +116,7 @@ they fail as *wrong behaviour* rather than compile errors.
 | `@hasDecl` | **only reports *public* declarations now.** Silent: it compiles and fails at runtime, so a test fixture's private hook needs `pub`. This one cost nine failing tests in `zpool`; expect the same in anything that dispatches on declarations. |
 | `std.meta.declarations()` | returns *names* (`[]const [:0]const u8`), not field descriptors. |
 | `@cImport` | **removed.** A `translate-c` step over the header produces a module to `@import`. |
+| `extern enum` | **a compile error:** *"enums do not support packed or extern"*. C enums from a header become `enum(c_int)` with members listed in the header's own order so the implicit values match. |
 | `std.meta.intToEnum` | gone → `std.enums.fromInt(...) orelse ...`, which returns an optional, not an error union. |
 | `std.meta.Int` | gone → `@Int(.unsigned, bits)`. |
 | `Fn.params` | → `param_types`. |
