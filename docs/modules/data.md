@@ -6,11 +6,14 @@ PostgreSQL remains a declared adapter (see the end of this file).
 
 ## Adapter interface
 
+The implemented types are `src/data/root.zig`'s; the contract names them
+`zurtr.data.*` and this is what they are:
+
 ```zig
-pub const Param = union(enum) {
+pub const Value = union(enum) {           // the contract's `Param`
     null,
-    bool: bool,
-    int: i64,
+    boolean: bool,
+    integer: i64,
     float: f64,
     text: []const u8,
     bytes: []const u8,
@@ -19,26 +22,54 @@ pub const Param = union(enum) {
 };
 
 pub const Database = struct {
-    ptr: *anyopaque,
+    context: *anyopaque,
     vtable: *const VTable,
+    tier: Tier,                          // how it was opened; read-only after construction
+    uncommitted_transactions: u64 = 0,   // dropped-handle counter (see below)
     pub const VTable = struct {
-        exec:    *const fn (ctx: *anyopaque, tx: ?*Tx, sql: []const u8, params: []const Param) Error!ExecResult,
-        query:   *const fn (ctx: *anyopaque, tx: ?*Tx, sql: []const u8, params: []const Param, rows: *RowSink) Error!void,
-        begin:   *const fn (ctx: *anyopaque, mode: TxMode) Error!*Tx,
-        commit:  *const fn (ctx: *anyopaque, tx: *Tx) Error!void,
-        rollback:*const fn (ctx: *anyopaque, tx: *Tx) Error!void,
-        close:   *const fn (ctx: *anyopaque) void,
+        exec:    *const fn (context: *anyopaque, tx: ?*Tx, sql: []const u8, params: []const Value) Error!ExecResult,
+        query:   *const fn (context: *anyopaque, tx: ?*Tx, sql: []const u8, params: []const Value, sink: RowSink) Error!void,
+        begin:   *const fn (context: *anyopaque, mode: TxMode) Error!*Tx,
+        commit:  *const fn (context: *anyopaque, tx: *Tx) Error!void,
+        rollback:*const fn (context: *anyopaque, tx: *Tx) Error!void,
+        close:   *const fn (context: *anyopaque) void,
     };
 };
 pub const ExecResult = struct { rows_affected: u64 };
 pub const TxMode = enum { read_write, read_only };
 ```
 
-- One `Database` per role process. The PostgreSQL adapter owns a connection
-  pool; `begin` checks out a connection from the pool for the tx lifetime.
-- `Tx` is a handle, not thread-safe, not storable. It must be committed or
-  rolled back explicitly; dropping it without either is a rollback plus a
-  recorded diagnostic (`contracts.md` §3).
+Two names differ from the earlier revision of this contract and are worth
+calling out, because `jobs` and `domain` both cite them: the value type is
+`Value`, not `Param` (`domain.policy` defines its own `Param` for the read
+predicate, and says why), and the tags are `boolean`/`integer`, not
+`bool`/`int`.
+
+`Tier` is what a database was opened as — `.memory`, `.file`,
+`.sync(Sync)`, `.distributed(Distributed)` — and `Tier.describe()` is its
+one-line form for logs and reports. `Lease` is declared beside it for the
+`.distributed` write lease, but nothing reads its `ttl_ms`: the adapter's
+`Engine.claimLease` hard-codes a one-second expiry, which is what the
+two-process tests are sized around (`src/data/turso_adapter.zig`,
+`src/data/nodes_test.zig`).
+
+- One `Database` per role process, and the Turso adapter keeps that literally:
+  one engine, one connection, no pool (`src/data/turso_adapter.zig`). The pool
+  below belongs to the PostgreSQL adapter, which is declared and not built.
+- `Tx` is a handle, not thread-safe, not storable: `Tx.commit`/`Tx.rollback` set
+  a `done` flag so a second attempt is a no-op rather than a second statement.
+  **The contract's rule that a tx dropped without either is rolled back with a
+  recorded diagnostic is not implemented.** `uncommitted_transactions` exists
+  and is never incremented, and the adapter does not roll back a dropped
+  handle: `Engine.begin` refuses a second transaction while one is live
+  (`error.Operation`) and `releaseTxHandle` reclaims the handle only on the next
+  `begin` or on `close`, so a `*Tx` dropped mid-scope leaves the connection
+  inside a transaction until the engine closes. `contracts.md` §3 and this
+  document say what should be true; the counter is where it would be recorded.
+- One transaction at a time, per engine, is enforced rather than assumed: a
+  second `begin` while one is live is `error.Operation` (`src/data/root.zig`'s
+  `Error` set has that member too, and this section used to omit it).
+  Nesting is a surface concern, expressed with savepoints.
 - **Execution mode is the caller's, not the adapter's.** The parked/blocking split in earlier revisions
   of this contract is gone (`docs/architecture/decisions.md`, D1): the framework has two execution
   classes — synchronous, and the `.ASYNC` lane, where a driver round trip parks the fiber and never the
@@ -47,50 +78,83 @@ pub const TxMode = enum { read_write, read_only };
   (jobs/agents), which is where the taxonomy's `unavailable` and `timeout` classes become policy; the
   adapter keeps no deadline of its own.
 - Errors are mapped to the framework taxonomy (`contracts.md` §5):
-  `unavailable` (pool exhausted, connection lost), `conflict` (unique/FK
-  violation, serialization failure), `timeout`, `syntax` (bug), `internal`.
+  `unavailable` (dependency down, connection lost, out of memory — the
+  PostgreSQL pool's exhaustion belongs here), `conflict` (unique/FK violation,
+  serialization failure, a busy engine), `timeout`, `syntax` (the SQL does not
+  compile: a programmer error), `operation` (the engine refused it — a
+  constraint, a type mismatch, a closed handle, a read-only database) and
+  `internal` (a bug in the adapter or the engine's own state). The adapter's
+  mapping is by *consequence* rather than by name, and it is the two `mapError`
+  functions at the end of `src/data/turso_adapter.zig`.
 
 ## Rows
 
-`RowSink` is a push-style cursor: `pub fn row(self: *RowSink, columns: []const Value) !void`
+`RowSink` is a push-style cursor: `pub fn row(self: RowSink, columns: []const Value) Error!void`,
 with columns borrowed for the duration of the call; implementations copy what
-they keep. `Value` mirrors `Param` minus `null` ambiguity: `null` is a distinct
-tag. Column names and PG type OIDs are available via `RowSink.describe()`.
-There is deliberately no lazy iterator API in v1: borrow-scope bugs are the
-main risk this design removes.
+they keep. `Value` mirrors the contract's `Param` minus `null` ambiguity: `null`
+is a distinct tag. There is deliberately no lazy iterator API in v1:
+borrow-scope bugs are the main risk this design removes.
+
+Column *names* are not available: `RowSink` is two fields (`context` and a
+`push` function) and nothing else — there is no `describe()`, and the PostgreSQL
+type OIDs that would come with a live PG adapter have nowhere to arrive. A
+caller that needs names can select them into a row it decodes positionally, which
+is what `jobs` does (`src/jobs/root.zig`'s `decodeJob`), and the value tags it
+can expect are the five the adapter produces: `null`, `integer`, `float`, `text`,
+`bytes` (`toDataValue`; `boolean`, `uuid` and `timestamp_micros` are encodable
+but come back as `integer`/`bytes`, which is the mapping SQLite forces).
 
 ## Migrations
+
+**Not implemented.** There is no migration API in `src/data/root.zig`, no
+`zurtr_schema_migrations` anywhere in the tree, and no `zurtr migrate` command
+(`src/main.zig` ships `modules` and `new`, and lists `migrate` among the
+commands that arrive with the modules they drive). What the contract asks for,
+when it is built:
 
 - Migrations are ordered `(version: i64, name, sql)` records declared in Zig
   (comptime array in the app), stored applied in `zurtr_schema_migrations`.
 - Each migration runs in its own transaction; migration order is by version;
-  duplicate or gap-free? — duplicates rejected, gaps allowed.
+  duplicates rejected, gaps allowed.
 - `zurtr migrate` applies pending migrations; dev mode applies on start;
   release apps require an explicit migrate step (no silent schema changes).
 - Down-migrations are not supported in v1 (forward-only), matching the
   single-executable deployment model.
 
+The stand-in in the tree is the one the adapter and `jobs` both use: every
+statement is `IF NOT EXISTS`, so applying a module's schema on every start is
+idempotent and startup is the only migration step those modules need.
+`src/jobs/schema.zig` also exports its statements (`zurtr.jobs.storage.statements`)
+so an application that owns its ordered migration list can fold them in once the
+runner exists — which is why it exports them rather than keeping them private.
+
 ## Query construction and read authorization
 
-- Explicit SQL through `Database.query`/`exec` is always available.
-- Resource reads go through `data.query(Resource)` which builds
-  `select ... from <table> [where ...] [order by ...] [limit ...]`.
-- **Read authorization compiles into the predicate**: a resource declares a
-  read policy `fn (principal) ?Policy` where
-  `Policy = struct { sql: []const u8, params: []const Param }`; the builder
-  ANDs it into every query before `order by`/`limit` (so pagination and
-  aggregates are computed over authorized rows only). A resource with no read
-  policy is denied unless explicitly declared `public`. Post-filtering a page
-  is a contract violation and there is no API for it.
+- Explicit SQL through `Database.query`/`exec` is always available, and it is
+  all that exists today: `data.query(Resource)` does not, because there is no
+  resource layer (`docs/modules/domain.md` §Resources).
+- **Read authorization compiles into the predicate**, and the predicate half is
+  implemented in `src/domain/policy.zig`:
+  `Policy.sqlPredicate(principal, scratch)` returns
+  `Policy.Query = { sql: []const u8, params: []const Param }` — the fragment to
+  AND into a resource query before `order by`/`limit` — or `null` when the read
+  must be denied. `null` never means "no filter": the caller returns zero rows
+  and never runs the query unfiltered, and `Query.tautology` (`sql = "true"`) is
+  what a policy that allows every row returns. The builder that would consume it
+  is the resource layer above, which is not built.
+- A resource with no read policy is denied unless explicitly declared `public`;
+  post-filtering a page is a contract violation and there is no API for it.
 - Write policies are checked by `domain` before `insert`/`update`/`delete`;
   the generated statements include the policy predicate as a guard so a denied
-  write affects zero rows and reports `authz`, not `conflict`.
+  write affects zero rows and reports `authz`, not `conflict`. Nothing generates
+  those statements yet.
 
 ## Turso adapter (`zurtr.data.turso`)
 
-`examples`-free and small on purpose: the adapter owns one `turso.Database` and one
-`turso.Connection` per role process — no pool, no sharing — exactly as §"Adapter interface" requires
-("one `Database` per role process"). The binding is vendored at `deps/turso`; its native SDK Kit is
+Small on purpose: the adapter owns one `turso.Database` and one
+`turso.Connection` per role process — no pool, no sharing — exactly as
+§"Adapter interface" requires ("one `Database` per role process"). The binding is
+vendored at `deps/turso`; its native SDK Kit is
 compiled from Rust source, so the adapter is behind `-Dturso` and the base build never sees it.
 
 Parameters cross as a runtime `[]const Value` and are mapped into the binding's own runtime `Value`;
@@ -162,9 +226,13 @@ holder renews. It is held through the database itself, so a node that can write 
 lease and a node that cannot reach the database cannot hold one. A node that dies holding the lease
 loses it when the expiry passes and the next claimant takes over with no coordination step in between.
 
-Implemented for every tier (`Engine.claimLease`, `leaseHolder`, `releaseLease`), which is what makes it
+Implemented for every tier (`Engine.claimLease`, `leaseHolder`, `releaseLease`; the table is created on
+open at every tier), which is what makes it
 testable without a remote: two claimants, one winner, an expiry, and a stale holder that cannot release
-someone else's lease. The recovery sentence above is a claim about a node that *does not* get to exit,
+someone else's lease. A lease lasts one second — `claimLease` writes `now + 1_000_000` microseconds —
+and it is enforced where writes begin rather than trusted to the caller: `Engine.begin` claims the lease
+for a read-write transaction on the `.distributed` tier and answers `error.Conflict` when somebody else
+holds it, while reads never need it (one writer, many readers). The recovery sentence above is a claim about a node that *does not* get to exit,
 so it is tested that way: `test-data-nodes` kills a holder mid-hold with `SIGKILL` and the survivor's
 takeover is asserted from its own output — see "Testing requirements" below.
 
@@ -212,15 +280,24 @@ Limits of the tiers above, stated so the next reader does not have to rediscover
   `-Dsync-remote=<url>` is given (below). There is no `test-db` step and no `ZURTR_DB_URL` anywhere in
   the tree; a live-database integration suite arrives with the PostgreSQL adapter, which is declared and
   not built.
-- The steps that exist: `zig build test-zurtr` (the framework), `zig build test-zix` (the vendored
-  transport), `zig build test-data -Dturso=true` and `zig build test-data-nodes -Dturso=true` (below),
-  and `zig build test-zscript -Dzscript=true` (the QuickJS layer). `zig build test` aggregates
-  whichever of them the configuration asked for.
+- The steps that exist: `zig build test-zurtr` (the framework module),
+  `zig build test-zix` (the vendored transport), `zig build test-data -Dturso=true`
+  (`src/data/tests.zig`, 11 tests) and `zig build test-data-nodes -Dturso=true`
+  (`src/data/nodes_test.zig`, 2 tests, below), `zig build test-cli` (the project
+  generator, `src/scaffold.zig`), and — with `-Dzscript=true` —
+  `test-zscript`, `test-zeex` and `test-zeex-live`. `zig build test` aggregates
+  all of them **except `test-cli`**: it depends on the zurtr, zix, data, nodes,
+  script, zeex and zeex-live runs, and the generator's tests are a step only
+  (`build.zig`).
 - Turso: `zig build test-data -Dturso=true` runs the tier tests — every value tag round-tripping,
-  a unique violation mapping to `conflict`, commit and rollback semantics, reopen durability for the
-  file tier, the write lease, and (with `-Dturso-sync=true`) the sync tier opening over a local file
-  and refusing to pretend when its remote does not answer. It runs against the real native SDK Kit, and
-  it is part of `zig build test -Dturso=true`.
+  a unique violation mapping to `conflict`, commit and rollback semantics (including that a
+  transaction reads its own uncommitted writes, and that the adapter releases a `Tx` handle rather than
+  leaking it to the caller's allocator), reopen durability for the
+  file tier, the write lease, the sync tier's behaviour with and without the SDK Kit, and the
+  `.distributed` tier's refusal to write without the lease. It runs against the real native SDK Kit, and
+  it is part of `zig build test -Dturso=true`. Its `build_options` carry `turso_sync` and
+  `sync_remote`, which is why the one test that needs a server can skip (`error.SkipZigTest`) instead of
+  being excluded.
 - Turso, across processes: `zig build test-data-nodes -Dturso=true` builds `src/data/node.zig` and runs it
   as two unrelated processes over one `.distributed` database file, twice over and both asserted: a
   holder that *exits* without releasing (the follower reads its row, is refused with `conflict`, takes
@@ -228,12 +305,22 @@ Limits of the tiers above, stated so the next reader does not have to rediscover
   no handler, no flush and no release — the survivor opens the still-held file, sees exactly the killed
   holder's committed row and nothing half-written, is refused by the dead holder's lease, and takes over
   when it expires). The pids, the signal the holder died by and each attempt's outcome are in the
-  harness's output, so "two processes, killed not exited" is checkable rather than assumed.
+  harness's output, so "two processes, killed not exited" is checkable rather than assumed. Both cases
+  assert liveness against the process table (`kill(pid, 0)`, `running()`) rather than against the lease
+  row, which outlives its holder by a second.
 - Turso, against a live sync endpoint: `zig build test-data -Dturso=true -Dturso-sync=true
   -Dsync-remote=<url>` adds the round trip described under "The sync tier's remote"; without the flag
   that one test skips.
-- Transaction semantics tests: commit persists, rollback discards, scope-exit
-  rolls back, unique violation maps to `conflict`, pool exhaustion maps to
-  `unavailable` and recovers.
-- Read-policy tests: policy predicate applied before `limit`, denied reads
-  return zero rows (not an error), `public` resources bypass policy.
+- Transaction semantics tests, as they stand: commit persists, rollback discards,
+  a unique violation maps to `conflict` (`src/data/tests.zig`). Two rules the
+  contract states are **not** tested because they are not implemented: a
+  `Tx` dropped without commit or rollback being rolled back with a recorded
+  diagnostic (`uncommitted_transactions`), and pool exhaustion mapping to
+  `unavailable` — there is no pool to exhaust until the PostgreSQL adapter
+  exists.
+- Read-policy tests live with the policy, not with the adapter:
+  `src/domain/policy.zig` pins a filter narrowing a read with a borrowed
+  parameter buffer, a filter with no authorized row set denying the read, and a
+  denied policy never consulting its predicate. What is missing is the layer
+  between: no resource declares a read policy, no builder ANDs one into a query,
+  and no test asserts a denied read returning zero rows instead of an error.
