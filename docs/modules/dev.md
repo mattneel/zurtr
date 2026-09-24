@@ -265,7 +265,10 @@ else depends on.
 One inclusion rule follows from all of this, and is easy to be wrong about: a file's tests are in a
 test binary only if that binary's root reaches the file. `src/root.zig`'s test block names
 `runtime.pool`, `runtime.mpmc` and `runtime.task` for exactly that reason — `test-zurtr` runs their
-tests because the root references them, not because they are under `src/`.
+tests because the root references them, not because they are under `src/`. And a step is not a
+reference: the template engine's suite sat inside `test-cli` without running until
+`src/scaffold.zig`'s test block named it, which is why that reference is written down in
+`scaffold.zig` with the reason attached rather than left as an import.
 
 ## Testing requirements (meta)
 
