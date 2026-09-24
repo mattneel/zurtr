@@ -60,8 +60,10 @@ error at the call site**, not a blank spot on a page. Nothing about a template c
 fail at runtime for a reason a compile could have caught, which is what makes this
 worth generating rather than interpreting. (The generated file therefore has to be
 compiled in a module that can `@import("zurtr")`, and `zurtr.live.tree` has to stay
-exported from the framework root — it is named in every file this module emits;
-see `docs/architecture/decisions.md` and `src/root.zig`.)
+exported from the framework root — it is named in every file this module emits. That export
+was added at `dae8366`, and `src/root.zig`'s test block is what holds it: the compiler
+cannot import the framework, so the one place both sides are visible asserts the two names
+the emitter writes.)
 
 Escaping is the render tree's business, not the template's: `text` escapes and
 `raw` does not, so a template never chooses which interpolation was the safe one.
@@ -219,9 +221,17 @@ that property — the component calls it, or does not.
   semantic mistake — a name that does not resolve, a field the props struct does
   not have — surfaces in the application's build, which is the design's whole
   intent, but it also means a wrong *prologue* (an import path, a type name)
-  passes every test in this module. That happened: the emitted signature named
-  `zurtr.live.tree` before the framework root exported it, so every generated
-  template failed in the caller's build while this module's tests stayed green.
+  passes every test in this module. That is not hypothetical, and the case is worth
+  keeping: the emitted signature named `zurtr.live.tree` before the framework root
+  exported `tree`, so **every** generated template failed in the caller's build while
+  this module's tests stayed green — they lower a template and parse the result, and
+  `zurtr.live.tree` is a semantic lookup that parsing never performs (`dae8366`). The
+  repair was two things, and the second is the one that stops it recurring: export
+  `tree`, and make the names the emitter depends on checkable where both sides are
+  visible. `compile.zig` cannot import `zurtr` — that would be a module cycle — so the
+  check lives in `src/root.zig`'s test block, which fails the build on
+  `@hasDecl(live, "tree")` and `@hasDecl(live.tree, "Builder")` with a message naming
+  what broke, instead of leaving the application's build to discover it.
 
 ## Testing
 
@@ -241,7 +251,9 @@ a slot carries the loop variables its children use; and the refusals come back a
 something the generated code binds.
 
 They do **not** pin the generated code's types, and they cannot run without
-`-Dzscript`, so a base build exercises none of this.
+`-Dzscript`, so a base build exercises none of this. The one exception is deliberate:
+the two names every emitted file's prologue depends on are asserted in
+`src/root.zig`'s test block, because this module's tests cannot see them (`dae8366`).
 
 ## Not yet
 

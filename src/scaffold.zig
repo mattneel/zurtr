@@ -267,6 +267,14 @@ const testing = std.testing;
 
 const base: Options = .{ .name = "hello", .dir = "hello" };
 
+test {
+    // Referencing the engine here is what makes its tests run: a module's tests are only analysed
+    // when something in an analysed file names it, and `templ.zig` is otherwise just imported.
+    // Without this line its fourteen tests exist and never execute — which is how they were found,
+    // by asking `test-cli` how many tests it ran and getting four.
+    _ = templ;
+}
+
 test "a condition selects exactly the entries whose flag is set" {
     // A fixture plan, not the manifest, so the mechanism is exercised today rather than when the
     // manifest happens to grow a conditional entry. Every variant is covered because every variant

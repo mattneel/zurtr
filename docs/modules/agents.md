@@ -75,22 +75,33 @@ create table zurtr_agent_signals (
   recovery re-reads `zurtr_agent_steps`; steps with `effect_status=succeeded`
   are applied from `effect_result` without re-issuing the effect
   (`contracts.md` §5).
-- The run row is the lease/lock: a worker claims a run with the same claim
-  discipline as jobs — one statement inside a write transaction (separate queue,
-  `zurtr_agents`) — so two workers never decide concurrently for one run.
+- The run row is the lease/lock: a worker claims a run with the claim discipline
+  `jobs` now implements — the candidate is read, then taken by an `UPDATE` whose
+  `WHERE` is the whole guard, with `rows_affected` as the verdict, all inside one
+  write transaction (`src/jobs/root.zig`) — so two workers never decide
+  concurrently for one run. The queue is the agent's own (`zurtr_agents`), so
+  agent work never competes with job work for a claim; what it inherits is the
+  discipline, including its ownership rule: a worker whose lease expired is
+  refused rather than allowed to overwrite the attempt that took it over.
 - `apply` must be deterministic given `(state, effect_result)`; it must not
   perform I/O. All I/O happens in effects (actions, or explicit `effect`
   declarations executed by the runner with recorded results).
 - Signals are durable: `sendSignal(run_id, signal)` inserts into
   `zurtr_agent_signals`, and the runner delivers pending signals in id order.
   A `waiting` run wakes on the next poll tick — the storage has no notification
-  channel (`decisions.md` D4/D5), so what a signal gets instead of a wake-up is
-  a row that cannot be lost.
+  channel (`decisions.md` D4/D5), so nothing wakes a *different* process, while a
+  same-process enqueue is picked up at once because the queue raises an in-process
+  condition after the commit (`src/jobs/schema.zig`, `src/jobs/root.zig`). What a
+  signal gets instead of a wake-up is therefore a row that cannot be lost, and the
+  same two delivery paths jobs already has.
 - Versioned transitions: a run records `version`; the runner executes the
   workflow code for that version. New versions apply to new runs;
   migrating a live run is an explicit recorded operation, never implicit.
-- Cancellation and failure follow the jobs contract: cooperative checks at
-  step boundaries; `failed` retains the last error and the step it occurred at.
+- Cancellation and failure follow the jobs contract, as that module now implements it: a lease cannot
+  be revoked from outside, so cancellation is a state transition plus a per-worker snapshot — a
+  request on a leased row is recorded (`cancel_requested`) and the running attempt learns about it
+  from a set refreshed once per reap tick, which is why a check is a binary search and not a query
+  (`src/jobs/cancel.zig`). `failed` retains the last error and the step it occurred at.
 
 ## Effect execution and idempotency
 
@@ -98,9 +109,13 @@ create table zurtr_agent_signals (
   issuing, the runner records the intent (`effect_status=pending`); after,
   it records `succeeded` + result in the same transaction that advances the
   step. Crash between issue and record ⇒ replay sees `pending`, and the effect
-  must be idempotent (its action carries an idempotency key derived from
-  `(run_id, step)`) — this is why `domain` actions used as effects must accept
-  an explicit idempotency key in their `Input`.
+  must be idempotent — the key it is idempotent *by* is the caller's, which is
+  the shape `jobs` implements: the key travels beside the payload
+  (`EnqueueSpec.idempotency_key`) and a partial unique index turns a duplicate
+  into the existing row rather than a second one (`src/jobs/root.zig`,
+  `src/jobs/schema.zig`). An agent effect's key is derived from `(run_id, step)`
+  and passed the same way — into the action's `Input`, so the action's own write
+  is what deduplicates, never a read-back of the effect's side effects.
 - Effects are never retried blindly on `unavailable` beyond the job-level retry
   policy; the step is retried by the agent queue with its own backoff.
 
@@ -115,8 +130,10 @@ and none of them changes the loop:
   `Decision.call`, a clarifying turn that is `Decision.ask`, and a final answer that is
   `Decision.done`. The
   agent's tools *are* `domain` actions, so authorization, validation and transaction rules are the same
-  ones an HTTP request goes through. Provider choice, credentials and prompt assembly belong to the
-  application; this module records what was decided, not how.
+  ones an HTTP request goes through — the domain's `Surface` enum already carries `agent` beside
+  `http`, `live` and `job` (`src/domain/action.zig`), so an agent's invocation is recorded without a
+  second vocabulary. Provider choice, credentials and prompt assembly belong to the application; this
+  module records what was decided, not how.
 - **Decisions from a script.** `zurtr.zscript` may define `decide`/`apply` instead of Zig. What makes that
   workable is the same thing that makes the sibling `jzs` package's agent addons workable: the durable
   surface is exposed as host functions — `emit`, `checkpoint`, `sleep`, `cancelRequested` — and the run's
@@ -140,7 +157,11 @@ reload can never silently change what an in-flight run means.
   step history; `zurtr agents retry <run_id>` re-arms a failed run at its last
   step with the recorded results intact.
 - The same agent declaration is usable as a job (`Decision.call` on a single
-  action) — the lightweight path must not require the full durable workflow.
+  action) — the lightweight path must not require the full durable workflow. The
+  binding already exists in the shape `jobs` needs: `(kind, version)` → `run`,
+  with a startup `validate` that refuses an ambiguous registry
+  (`src/jobs/registry.zig`), so an agent's single-action case is a registry entry
+  rather than a second execution path.
 
 ## Testing requirements
 

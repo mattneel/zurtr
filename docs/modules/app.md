@@ -9,9 +9,16 @@ Status: **declared** — read the status from `src/root.zig`'s `modules` table, 
 the inventory of record (`zurtr modules` prints it); this document is the contract the
 module is held to, and the sections below are its design.
 
-The configuration sketch below names types the tree does not have yet;
-the exceptions are the transport type and the database handle, which are named
-after the real ones (`deps/zix/src/tcp/http1/config.zig`, `src/data/root.zig`).
+The configuration sketch below names types the tree does not have yet, with three
+exceptions, each named after the real thing: the transport config
+(`zix.Http1.ServerConfig`, aliased from `Http1ServerConfig` and declared in
+`deps/zix/src/tcp/http1/config.zig`), the database handle (`data.Tier`,
+`src/data/root.zig`), and `jobs.Config` — that module exists now, and the fields
+it holds (`queues`, `lease_ms`, `tick_ms`, `poll_interval_ms`, `batch`,
+`retention_ms`) are already the ones the sketch asks for, with backoff living
+beside them as `jobs.policy` (`src/jobs/retry.zig`) rather than inside the config.
+`live.Config` and `telemetry.Config` exist nowhere, so those two lines remain the
+design.
 
 ## Configuration
 
@@ -21,7 +28,7 @@ pub const Config = struct {
     db: data.Tier,                   // where the data lives: memory|file|sync|distributed
     app: struct { name: []const u8, secret: Secret, base_url: []const u8 },
     live: live.Config,               // queue bounds, idle timeout, snapshot policy
-    jobs: jobs.Config,               // queues, lease, backoff, retention
+    jobs: jobs.Config,               // queues, lease, poll, batch, retention
     telemetry: telemetry.Config,
 };
 ```
@@ -42,11 +49,17 @@ pub const Config = struct {
 
 - Routes are declared in one table (the "narrow registration table"):
   `app.get("/invoices/:id", Invoice.Show)` where the handler is a Zig function
-  or a domain action binding (`app.action(invoice.create)`).
+  or a domain action binding (`app.action(invoice.create)`). The table's type
+  already exists and is in use: `zix.Http1.Route` and the comptime `Router` that
+  partitions routes by kind — exact matches into a hash, parameters and prefixes
+  into arrays walked in order (`deps/zix/src/tcp/http1/router.zig`) — which is
+  what a generated application declares today. What this module adds is the
+  handler-side context and the action binding, not a second router.
 - A route handler receives `app.Ctx` (principal, db, tx scope, allocator,
   request view) and returns `app.Reply` — HTML (a `live` tree), JSON (typed
-  value), redirect, an action result, or `deferred`/`parked` (per
-  `contracts.md` §1).
+  value), redirect, an action result, or `deferred` (the async lane's owned
+  completion handle, per `contracts.md` §1 — there is no parked class to name,
+  `decisions.md` D1).
 - Middleware: ordered, explicit list (`middleware.Chain` extended with
   authenticated/session/telemetry entries); no implicit global middleware.
 - Static assets: served from a build-produced asset map (hashed names, cache
@@ -57,7 +70,11 @@ pub const Config = struct {
 
 - Principal types: `anonymous`, `user{id, roles}`, `service{name}`,
   `system{role}` (jobs/agents). Every surface carries one (see `contracts.md`
-  §4).
+  §4). The type is real and already this shape: `zurtr.domain.Principal`
+  (`src/domain/policy.zig`, re-exported by `src/domain/action.zig`), whose
+  `Surface` enum names the four surfaces an invocation can arrive from — `http`,
+  `live`, `job`, `agent`. What is left to this module is authentication — the
+  thing that produces a principal — not the vocabulary it is expressed in.
 - Session cookies for browser flows: signed, `HttpOnly`, `SameSite=Lax`,
   `Secure` outside dev; the signing key is the configured `app.secret`.
 - Live connections are authenticated once; each event is authorized per event
@@ -70,23 +87,36 @@ pub const Config = struct {
   target, or a job kind by naming it in the corresponding registry. The bridge
   decodes the surface payload into `Action.Input`, runs policy → validation →
   `run`, and maps the result per surface. One implementation, three surfaces —
-  no per-surface copies of domain logic.
+  no per-surface copies of domain logic. Two of the pieces it stands on are
+  already real: the invocation path is `Action.invoke`/`invokeTyped`
+  (`src/domain/action.zig`), which authorizes before it decodes so a denied
+  caller's payload is never parsed, and the job-kind registry is a
+  `(kind, version)` → `run` table validated at startup (`src/jobs/registry.zig`).
+  The route table and the live event target table are this module's to build.
 - **Pub/sub**: live sessions subscribe to topics
   (`pubsub.subscribe(:invoice, id)`); a committed write publishes to the
   worker-local broker for the subscribers that are *present*, and records the
   event in the **outbox** in the same transaction as the state change. The
-  outbox is the durable path; the broker is fan-out, and a view that missed
-  events resyncs from a revisioned snapshot (`decisions.md` D4,
-  `docs/modules/live.md`). Subscribers receive `Info` messages on the session
-  owner thread.
+  broker half exists: `src/live/pubsub.zig` is a worker-local, single-threaded
+  `Broker` with `subscribe`/`unsubscribe`/`unsubscribeAll`/`publish`, delivering
+  to each present session through that session owner's queue, and it is
+  explicitly not durable — a publish with no subscribers is dropped
+  (`docs/modules/live.md`). What this module owns is the transaction around it:
+  the outbox row goes in with the state change, the publish happens after the
+  commit and never inside it, and a view that missed events resyncs from a
+  revisioned snapshot (`decisions.md` D4). Subscribers receive `Info` messages on
+  the session owner thread.
 
   There is no `pg_notify` anywhere: the only built adapter is Turso, which is
   SQLite-compatible and has no `LISTEN`/`NOTIFY`. zix's `postgrez` driver does
   have it (`deps/zix/src/driver/postgrez/src/notify.zig`), but it backs no built
   adapter.
-- **Jobs bridge**: `jobs` runs in its role process; the web role enqueues.
-  Job completion that must reach a live session is published through pub/sub
-  (the slice uses exactly this path).
+- **Jobs bridge**: `jobs` runs in its role process; the web role enqueues. The runner
+  half already exists as a type — `jobs.Runner`, with a `Tick` of counters for what one
+  pass did (`src/jobs/runner.zig`) — so what this module adds is the process-level
+  wiring, which is `zurtr run --role=jobs` (`docs/modules/dev.md`). Job completion that
+  must reach a live session is published through pub/sub (the slice uses exactly this
+  path).
 
 ## Telemetry
 
