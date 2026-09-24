@@ -49,6 +49,12 @@
         // the native libraries arrive as prebuilt archives, one pinned tarball per target, fetched
         // when a build actually reaches zgpu. Vendoring Dawn's source instead would be ~60 Chromium
         // sub-repositories (541 MB, 492k lines of C++) for no gain at this layer.
+        .zgpu = .{ .path = "deps/zgpu" },
+        // The window layer, vendored at deps/zglfw (see its UPSTREAM.md). GLFW 3.4 as source, built
+        // for both X11 and Wayland. zgpu deliberately does not create windows - it takes a vtable of
+        // function pointers and an opaque window handle - so this is the other half of a native GPU
+        // application. Like zgpu, it is inert until a build actually reaches it.
+        .zglfw = .{ .path = "deps/zglfw" },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
