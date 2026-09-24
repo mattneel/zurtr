@@ -323,18 +323,16 @@ pub fn build(b: *std.Build) void {
     // The command-line layer: the generator's manifest and — once the engine lands — the renderer.
     // Its tests cannot ride inside `test-zurtr`, since neither file is part of the framework module,
     // and a test nobody runs is a comment.
-    {
-        const scaffold_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/scaffold.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        const run_scaffold_tests = b.addRunArtifact(scaffold_tests);
-        const test_cli_step = b.step("test-cli", "Run the project generator's tests");
-        test_cli_step.dependOn(&run_scaffold_tests.step);
-    }
+    const scaffold_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/scaffold.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_scaffold_tests = b.addRunArtifact(scaffold_tests);
+    const test_cli_step = b.step("test-cli", "Run the project generator's tests");
+    test_cli_step.dependOn(&run_scaffold_tests.step);
 
     // ZEEX's compiler is self-contained: it imports the script layer and nothing above it, so it
     // gets its own step rather than riding inside `test-zurtr`, where a failure in it would be
@@ -426,4 +424,9 @@ pub fn build(b: *std.Build) void {
     if (script_test_run) |run| test_step.dependOn(&run.step);
     if (zeex_test_run) |run| test_step.dependOn(&run.step);
     if (zeex_live_test_run) |run| test_step.dependOn(&run.step);
+    // Not conditional, so not in a `?*Run` above — but it has to be here, or `zig build test`
+    // quietly runs everything except the generator's tests. Found by reading the dependOn list
+    // against the steps that exist, which is the only way an omission like this shows up: a
+    // missing dependency is invisible in the output.
+    test_step.dependOn(&run_scaffold_tests.step);
 }
