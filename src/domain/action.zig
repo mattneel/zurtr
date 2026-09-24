@@ -164,6 +164,10 @@ pub fn Action(comptime Spec: type) type {
         pub const errors = Error;
         /// The spec's declared out-of-process effects (`.{ .http, .email }`), if
         /// any; `jobs`/`agents` read this to require recorded results.
+        ///
+        /// Note: under Zig 0.17 `@hasDecl` sees only *public* declarations, so a
+        /// spec that writes `const effects` rather than `pub const effects` gets
+        /// `.{}` here and its effects are silently unenforced. Declare it `pub`.
         pub const effects = if (@hasDecl(Spec, "effects")) Spec.effects else .{};
 
         /// The shape `invoke` accepts as its decoder: the application's codec.
