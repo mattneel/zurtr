@@ -66,8 +66,6 @@ pub const Error = error{
 /// eventually cause.
 const bindings = [_]struct { text: []const u8, is_flag: bool }{
     .{ .text = "name", .is_flag = false },
-    .{ .text = "zurtr_path", .is_flag = false },
-    .{ .text = "fingerprint", .is_flag = false },
     .{ .text = "data", .is_flag = true },
     .{ .text = "live", .is_flag = true },
     .{ .text = "zscript", .is_flag = true },
@@ -77,7 +75,7 @@ const bindings = [_]struct { text: []const u8, is_flag: bool }{
 pub const Binding = union(enum) {
     /// Text, written where `{{name}}` appears.
     value: []const u8,
-    /// A flag, read by `{{#if name}}` and `{{#unless name}}`.
+    /// A flag, read by `{{#if data}}` and `{{#unless data}}`. Never substituted.
     flag: bool,
 };
 
@@ -90,16 +88,6 @@ pub const Binding = union(enum) {
 pub const Params = struct {
     /// The generated project's name: `{{name}}`.
     name: []const u8,
-    /// Absolute path to the zurtr checkout the generated project builds against: `{{zurtr_path}}`.
-    zurtr_path: []const u8,
-    /// The generated project's `build.zig.zon` fingerprint: `{{fingerprint}}`.
-    ///
-    /// The toolchain validates that field, and a `.zon` holds literals only, so no template can carry
-    /// it: the generator derives the number from `name` and hands it over as the 16 lowercase hex
-    /// digits the literal needs. The engine substitutes it like any other value, which is the right
-    /// division — the template decides that a fingerprint goes on that line, the generator decides
-    /// what it is.
-    fingerprint: []const u8,
     /// Flags, conditions only. `data` has a data layer, `live` a LiveView layer, `zscript` a script
     /// engine; a cleared flag means the generated project has no such thing in it.
     data: bool = false,
@@ -500,8 +488,8 @@ fn writeTag(w: *std.Io.Writer, parts: []const []const u8) std.Io.Writer.Error!vo
     try w.writeAll("}}");
 }
 
-/// `values {name, zurtr_path, fingerprint} and flags {data, live, zscript}` — what an unknown name
-/// could have been, listed from the same table the lookup uses.
+/// `values {name} and flags {data, live, zscript}` — what an unknown name could have been, listed
+/// from the same table the lookup uses.
 fn writeBindings(w: *std.Io.Writer) std.Io.Writer.Error!void {
     inline for (.{ false, true }) |is_flag| {
         try w.writeAll(if (is_flag) "flags {" else "values {");
@@ -518,13 +506,11 @@ fn writeBindings(w: *std.Io.Writer) std.Io.Writer.Error!void {
     }
 }
 
-/// Params for a test whose subject is the template rather than the params: a name, a path and a
-/// fingerprint that are only ever substituted, with the flags left to the caller.
+/// Params for a test whose subject is the template rather than the params: a name that is only ever
+/// substituted, with the flags left to the caller.
 fn paramsFor(flags: struct { data: bool = false, live: bool = false, zscript: bool = false }) Params {
     return .{
         .name = "p",
-        .zurtr_path = "/z",
-        .fingerprint = "0f1e2d3c4b5a6978",
         .data = flags.data,
         .live = flags.live,
         .zscript = flags.zscript,
@@ -551,22 +537,20 @@ fn expectFailure(expected: Error, source: []const u8, params: Params) !Diagnosti
     return diagnostic;
 }
 
-test "substitution writes a value and the padding inside the braces is not part of the name" {
+test "substitution writes the name and the padding inside the braces is not part of it" {
     try expectRender(
-        "proj proj /src/zurtr\t/src/zurtr 0f1e2d3c4b5a6978\n",
-        "{{name}} {{ name }} {{zurtr_path}}\t{{  zurtr_path  }} {{fingerprint}}\n",
-        .{ .name = "proj", .zurtr_path = "/src/zurtr", .fingerprint = "0f1e2d3c4b5a6978" },
+        "proj proj\tproj\n",
+        "{{name}} {{ name }}\t{{  name  }}\n",
+        .{ .name = "proj" },
     );
 }
 
 test "a value that looks like a tag is copied, never scanned again" {
-    // Re-scanned, the first would open an `#if` — and then fail as unterminated — and the second
-    // would be substituted twice.
-    try expectRender("<{{#if live}} {{name}}>", "<{{name}} {{zurtr_path}}>", .{
-        .name = "{{#if live}}",
-        .zurtr_path = "{{name}}",
-        .fingerprint = "f",
-    });
+    // Re-scanned, the first would open an `#if`, and then fail as unterminated.
+    try expectRender("<{{#if live}}>", "<{{name}}>", .{ .name = "{{#if live}}" });
+
+    // And a value containing a tag would be substituted a second time, from inside itself.
+    try expectRender("a{{name}}!b", "a{{name}}b", .{ .name = "{{name}}!" });
 }
 
 test "#if takes its body when the flag is set and drops it when it is not" {
@@ -661,7 +645,7 @@ test "a template with no placeholders is copied byte for byte" {
     try expectRender(&binary, &binary, paramsFor(.{}));
 
     // And the bytes around a substitution come out as they went in.
-    try expectRender("\x00\x01proj\xff", "\x00\x01{{name}}\xff", .{ .name = "proj", .zurtr_path = "/z", .fingerprint = "f" });
+    try expectRender("\x00\x01proj\xff", "\x00\x01{{name}}\xff", .{ .name = "proj" });
 }
 
 test "a flag cannot be substituted and a value cannot be a condition" {
@@ -671,8 +655,8 @@ test "a flag cannot be substituted and a value cannot be a condition" {
     }));
     try testing.expectEqualStrings("data", substituted.tag);
 
-    const conditioned = try expectFailure(error.ValueAsCondition, "{{#if zurtr_path}}x{{/if}}", paramsFor(.{}));
-    try testing.expectEqualStrings("zurtr_path", conditioned.tag);
+    const conditioned = try expectFailure(error.ValueAsCondition, "{{#if name}}x{{/if}}", paramsFor(.{}));
+    try testing.expectEqualStrings("name", conditioned.tag);
 }
 
 test "a malformed tag and an unknown directive are told apart from an unknown name" {
@@ -712,11 +696,7 @@ test "the diagnostic reads as a position, a reason, and the source line with a c
         \\pub const app_name = "{{nam}}";
         \\
     ;
-    const diag = try expectFailure(error.UnknownName, source, .{
-        .name = "proj",
-        .zurtr_path = "/src/zurtr",
-        .fingerprint = "0f1e2d3c4b5a6978",
-    });
+    const diag = try expectFailure(error.UnknownName, source, .{ .name = "proj" });
 
     try testing.expectEqual(@as(usize, 2), diag.line);
     try testing.expectEqual(@as(usize, 25), diag.column);
@@ -725,7 +705,7 @@ test "the diagnostic reads as a position, a reason, and the source line with a c
     var w = std.Io.Writer.fixed(&buffer);
     try diag.write(&w, source);
     try testing.expectEqualStrings(
-        \\line 2, column 25: no name `nam`: this generator binds values {name, zurtr_path, fingerprint} and flags {data, live, zscript}
+        \\line 2, column 25: no name `nam`: this generator binds values {name} and flags {data, live, zscript}
         \\  | pub const app_name = "{{nam}}";
         \\  |                         ^
         \\

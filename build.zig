@@ -163,7 +163,24 @@ pub fn build(b: *std.Build) void {
     const cli_options = b.addOptions();
     // Untracked: a directory cannot be hashed as a build input, and this path is not an input —
     // it is a string the generator writes into someone else's build.zig.zon.
-    cli_options.addOptionPathUntracked("zurtr_source_path", b.path("."));
+    // `addOptionPath` resolves to a *root-relative* string (it wrote `"."`), and the generator
+    // needs an absolute one: it runs somewhere else entirely and has to turn this into a path
+    // relative to the project it is creating. `@src()` is this file's own path, which the compiler
+    // makes absolute, so its directory is the build root as a string.
+    // The generator runs somewhere else entirely — in the project it is creating — and has to turn
+    // this into a path relative to that project, so it needs an absolute one here.
+    //
+    // Neither `addOptionPath` (it writes a root-relative string: `"."`) nor `@src().file` (the file
+    // name, not a path) nor any `Build` field gives an absolute build root in this toolchain, so it
+    // is resolved from the process directory the build was started in. Failing loudly rather than
+    // falling back to ".": a relative value is not a small error, it is the whole feature failing.
+    const checkout_root = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, ".", b.allocator) catch
+        @panic("zurtr build: cannot resolve the build root; `zurtr new` needs it to be absolute");
+    cli_options.addOption([]const u8, "zurtr_source_path", checkout_root);
+    // The generator drives the compiler that built it: a `zig` on PATH may be a launcher shim that
+    // cannot resolve a version in an empty directory, and that failure would look like the
+    // generator's.
+    cli_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
 
     const clap_dep = b.dependency("clap", .{ .target = target, .optimize = optimize });
     const exe = b.addExecutable(.{

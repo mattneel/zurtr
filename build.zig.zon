@@ -84,6 +84,11 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        // The vendored dependencies. Without this a fetched copy of zurtr arrives without them and
+        // fails at the *consumer's* first build, not here: the manifest references `deps/zix`,
+        // `deps/quickjs-ng`, `deps/turso` and `deps/zig-clap` by path, and `.paths` is what decides
+        // which files survive being a package — a missing entry is a package that cannot build.
+        "deps",
         // For example...
         //"LICENSE",
         //"README.md",

@@ -1,32 +1,40 @@
 //! The project generator: `zurtr new`.
 //!
-//! Two halves, and the split is the point. This half is the **plan** — which files a scaffold
-//! contains, under which conditions, and which installer hooks run afterwards — expressed as data
-//! so it can be read in one screen and tested without touching a filesystem. The other half renders
-//! that plan through `src/templ.zig` and writes it.
+//! The recipe is deliberately not "write a whole project from scratch". It is:
 //!
-//! Why not a script: a scaffold that produces a project which does not build is worse than no
-//! scaffold, because the failure arrives at the user's first command with no obvious cause. So the
-//! plan is declarative, every entry is checked by a test that renders it, and `zurtr new` refuses
-//! to write over an existing directory rather than merging into it.
+//!   1. `zig init` — the toolchain's own scaffold, in the target directory.
+//!   2. `zig fetch --save <this checkout>` — the toolchain adding zurtr as a dependency.
+//!   3. our template over the example — `build.zig`, `src/main.zig`, `.gitignore`, `README.md`.
+//!   4. delete `src/root.zig`, which is the library half of zig's example and not an application.
+//!   5. the installer hooks.
 //!
-//! The conditional entries are what make composition possible without a plugin API: a scaffold
-//! carries every variant's files and each declares what it needs. `--no-data` does not remove a
-//! file from the manifest, it stops the entries whose `when` is `.data` from being written, and the
-//! templates that survive are the same ones — which is why there is one template set rather than
-//! three.
+//! Two things fall out of letting the toolchain do its own work. `build.zig.zon` is zig's,
+//! including the `.fingerprint` field it validates against a CRC of the project name — a value no
+//! scaffolder can hardcode, because a zon takes only an integer literal and the value depends on
+//! the name. And the dependency is written by the tool that knows the dependency's format,
+//! including the relative-path restriction the zon enforces. Both were blockers found by reading
+//! the compiler; both are answered by not doing them ourselves.
+//!
+//! The manifest below is the plan — which files a scaffold contains, under which conditions, and
+//! which hooks run afterwards — expressed as data so it can be read in one screen and tested
+//! without a filesystem. Conditional entries are what make composition possible without a plugin
+//! API: a scaffold carries every variant's files and each declares what it needs, so `--no-live`
+//! does not remove a file from the manifest, it stops the entries whose condition is `.live` from
+//! being written.
 
 const std = @import("std");
+const Io = std.Io;
+const templ = @import("templ.zig");
 
-/// What the caller asked for. Every conditional in the manifest is answered by this.
+/// What the caller asked for, plus what the executable knows about itself.
 pub const Options = struct {
-    /// The project name: the directory name by default, and the `{{name}}` the templates use.
+    /// The project name: the directory name, what zig's own scaffold will call it, and the
+    /// `{{name}}` the templates use.
     name: []const u8,
-    /// Where to write. Defaults to `<name>` in the current directory.
+    /// Where to write, relative to the current directory or absolute.
     dir: []const u8,
-    /// Write into a directory that already exists. Off by default: a generator that merges into
-    /// an existing tree is a generator that has to decide what a conflict means, and this one
-    /// would rather not.
+    /// Write into a directory that already exists. Off by default: a generator that merges into an
+    /// existing tree has to decide what a conflict means, and this one would rather not.
     force: bool = false,
     /// Include the persistence wiring (`--no-data` turns it off).
     data: bool = true,
@@ -44,8 +52,18 @@ pub const Options = struct {
     install: bool = false,
 };
 
-/// When an entry or a hook applies. One enum rather than a predicate per entry: the conditions are
-/// the flags the CLI exposes, and a test asserts every variant is reachable.
+/// Where this checkout is and which compiler to drive. Both are embedded by the build, because
+/// neither can be discovered at run time: the generated project lives somewhere else on disk, and
+/// the compiler that built this executable is the one whose version the generated manifest has to
+/// agree with — a `zig` found on PATH may be a shim that cannot resolve a version in an empty
+/// directory, which is a failure this generator would otherwise report as its own.
+pub const Toolchain = struct {
+    zurtr_path: []const u8,
+    zig_exe: []const u8,
+};
+
+/// When an entry or a hook applies. The conditions are the flags the CLI exposes, and a test
+/// asserts every variant is reachable.
 pub const Condition = enum {
     always,
     data,
@@ -62,22 +80,24 @@ pub const Condition = enum {
     }
 };
 
-/// One generated file. `template` names a file under `templates/` without its `.tpl` suffix, and
-/// `dest` is where the rendered output goes, relative to the project directory.
+/// One generated file. `source` is the template itself, embedded, so the generator carries its
+/// templates the way it carries everything else and a missing `.tpl` is a compile error rather
+/// than a runtime surprise. `dest` is where the rendered output goes, relative to the project
+/// directory.
+///
+/// `build.zig.zon` is deliberately absent: zig writes it, and `zig fetch --save` patches the
+/// dependency into it.
 pub const Entry = struct {
-    template: []const u8,
+    source: []const u8,
     dest: []const u8,
     when: Condition = .always,
 };
 
-/// The manifest. Adding a file to the scaffold means adding a line here and a `.tpl` beside the
-/// others; nothing else in the generator changes.
 pub const entries = [_]Entry{
-    .{ .template = "app/build.zig", .dest = "build.zig" },
-    .{ .template = "app/build.zig.zon", .dest = "build.zig.zon" },
-    .{ .template = "app/gitignore", .dest = ".gitignore" },
-    .{ .template = "app/README.md", .dest = "README.md" },
-    .{ .template = "app/src/main.zig", .dest = "src/main.zig" },
+    .{ .source = @embedFile("scaffold/templates/app/build.zig.tpl"), .dest = "build.zig" },
+    .{ .source = @embedFile("scaffold/templates/app/gitignore.tpl"), .dest = ".gitignore" },
+    .{ .source = @embedFile("scaffold/templates/app/README.md.tpl"), .dest = "README.md" },
+    .{ .source = @embedFile("scaffold/templates/app/src/main.zig.tpl"), .dest = "src/main.zig" },
 };
 
 /// A step the generator runs in the new project after writing it — the installer half.
@@ -87,44 +107,14 @@ pub const Hook = struct {
     label: []const u8,
     argv: []const []const u8,
     when: Condition = .always,
-    /// Hooks that compile or fetch are off unless `--install`. Everything else runs.
+    /// Hooks that compile or fetch are off unless `--install`.
     needs_install: bool = false,
 };
 
 pub const hooks = [_]Hook{
     .{ .label = "git repository", .argv = &.{ "git", "init", "-q" } },
-    .{
-        .label = "first build",
-        .argv = &.{ "zig", "build" },
-        .needs_install = true,
-    },
+    .{ .label = "first build", .argv = &.{ "zig", "build" }, .needs_install = true },
 };
-
-/// The value a generated project's `build.zig.zon` needs for `.fingerprint`, as 16 lowercase hex
-/// digits without a `0x` prefix — the form the templates interpolate.
-///
-/// This cannot be hardcoded: Zig validates the field as a packed `struct(u64) { id: u32, checksum:
-/// u32 }` with `checksum == Crc32(name)` and an id that is neither 0 nor 0xffffffff, and a zon
-/// accepts only an integer literal — no expressions. A wrong or absent fingerprint fails the
-/// generated project at `zig build` with "invalid fingerprint: 0x…", which would make the whole
-/// generator useless for every name but the one it was written for.
-///
-/// The id is 1 rather than random. The toolchain generates a random one, and its comment gives the
-/// reason uniqueness matters: only among packages in a single dependency graph. Two projects from
-/// this command have different names in theirs, so a fixed id is correct here — and a generator
-/// whose output changes between runs for the same input is harder to check than one whose output
-/// does not.
-///
-/// Verified against the toolchain rather than argued: in a zon with a dependency graph, `id = 1`
-/// builds and `id = 0xffffffff` is rejected with "invalid fingerprint: …; use this value: 0x…",
-/// and that suggested value's high half is exactly what `std.hash.Crc32` returns for the name — so
-/// this agrees with the compiler's own generator on the half that carries meaning.
-pub fn fingerprint(name: []const u8, out: *[16]u8) []const u8 {
-    const id: u32 = 1;
-    const value: u64 = (@as(u64, std.hash.Crc32.hash(name)) << 32) | id;
-
-    return std.fmt.bufPrint(out, "{x:0>16}", .{value}) catch unreachable;
-}
 
 /// The entries this run writes.
 pub fn planned(comptime plan: []const Entry, options: Options, out: []Entry) []Entry {
@@ -142,8 +132,9 @@ pub fn planned(comptime plan: []const Entry, options: Options, out: []Entry) []E
 /// The hooks this run executes.
 pub fn installers(comptime plan: []const Hook, options: Options, out: []Hook) []Hook {
     var count: usize = 0;
+    if (!options.hooks) return out[0..0];
+
     for (plan) |hook| {
-        if (!options.hooks) break;
         if (hook.needs_install and !options.install) continue;
         if (hook.when.holds(options)) {
             out[count] = hook;
@@ -152,6 +143,122 @@ pub fn installers(comptime plan: []const Hook, options: Options, out: []Hook) []
     }
 
     return out[0..count];
+}
+
+// --------------------------------------------------------------- //
+
+/// Generate a project. Every failure is reported to `out` as it happens and returned, so a caller
+/// that wants to explain the state it left behind knows which step failed.
+pub fn generate(
+    gpa: std.mem.Allocator,
+    io: Io,
+    options: Options,
+    toolchain: Toolchain,
+    out: *std.Io.Writer,
+) !void {
+    const target = try Io.Dir.cwd().createDirPathOpen(io, options.dir, .{});
+    defer target.close(io);
+
+    // 1. The toolchain's scaffold.
+    try run(gpa, io, &.{ toolchain.zig_exe, "init" }, target, out);
+
+    // 2. The dependency, as a path relative to the project. Absolute paths are rejected by the
+    //    zon, and the project is not necessarily a child of this checkout, so the relative form is
+    //    computed rather than assumed.
+    {
+        const project_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io, options.dir, gpa);
+        defer gpa.free(project_absolute);
+
+        // Both paths are absolute, so the process cwd and the environment are only there for the
+        // Windows branch and neither is consulted on this platform.
+        const relative = try std.fs.path.relativeAlloc(gpa, ".", null, project_absolute, toolchain.zurtr_path);
+        defer gpa.free(relative);
+
+        try run(gpa, io, &.{ toolchain.zig_exe, "fetch", "--save", relative }, target, out);
+    }
+
+    // 3. Our template over the example.
+    var plan_buffer: [entries.len]Entry = undefined;
+    for (planned(&entries, options, &plan_buffer)) |entry| {
+        try renderInto(gpa, io, options, entry, target, out);
+    }
+
+    // 4. The library half of zig's example. An application is not one, and leaving it means a
+    //    second module nothing imports.
+    Io.Dir.deleteFile(target, io, "src/root.zig") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
+    // 5. Hooks.
+    var hook_buffer: [hooks.len]Hook = undefined;
+    for (installers(&hooks, options, &hook_buffer)) |hook| {
+        try out.print("{s}: {s}\n", .{ options.name, hook.label });
+        try out.flush();
+
+        // A hook that needs this checkout's path gets it as an argument rather than a template:
+        // hooks run in the project, which is not where either path belongs.
+        try run(gpa, io, hook.argv, target, out);
+    }
+}
+
+fn renderInto(
+    gpa: std.mem.Allocator,
+    io: Io,
+    options: Options,
+    entry: Entry,
+    target: Io.Dir,
+    out: *std.Io.Writer,
+) !void {
+    // The one place the engine's parameter shape is written down. When it changes, this changes,
+    // and nothing else in the generator knows the engine has parameters at all.
+    var diagnostic: templ.Diagnostic = undefined;
+    var params: templ.Params = .{
+        .name = options.name,
+        .data = options.data,
+        .live = options.live,
+        .zscript = options.zscript,
+    };
+    params.diagnostic = &diagnostic;
+
+    const rendered = templ.render(gpa, entry.source, params) catch |err| {
+        // The engine fills the diagnostic rather than printing, because it cannot name the file:
+        // it renders bytes, and only the manifest knows which file those bytes were for.
+        try out.print("{s}: {s}:\n", .{ entry.dest, @errorName(err) });
+        try diagnostic.write(out, entry.source);
+        try out.flush();
+
+        return err;
+    };
+    defer gpa.free(rendered);
+
+    if (std.fs.path.dirname(entry.dest)) |parent| {
+        try target.createDirPath(io, parent);
+    }
+    try target.writeFile(io, .{ .sub_path = entry.dest, .data = rendered });
+}
+
+/// Run a command in a directory and fail loudly if it does. Its output goes to the caller's
+/// terminal rather than through a pipe: `zig init` and `git init` know better how to describe
+/// themselves than a generator does, and swallowing that would hide the one thing a user wants
+/// when a step they did not expect fails.
+fn run(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: Io.Dir, out: *std.Io.Writer) !void {
+    _ = gpa;
+    _ = out;
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .dir = cwd },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code == 0) return else return error.StepFailed,
+        else => return error.StepFailed,
+    }
 }
 
 // --------------------------------------------------------------- //
@@ -165,10 +272,10 @@ test "a condition selects exactly the entries whose flag is set" {
     // manifest happens to grow a conditional entry. Every variant is covered because every variant
     // is reachable from the CLI.
     const fixtures = [_]Entry{
-        .{ .template = "a", .dest = "always" },
-        .{ .template = "b", .dest = "data", .when = .data },
-        .{ .template = "c", .dest = "live", .when = .live },
-        .{ .template = "d", .dest = "zscript", .when = .zscript },
+        .{ .source = "a", .dest = "always" },
+        .{ .source = "b", .dest = "data", .when = .data },
+        .{ .source = "c", .dest = "live", .when = .live },
+        .{ .source = "d", .dest = "zscript", .when = .zscript },
     };
     var buffer: [fixtures.len]Entry = undefined;
 
@@ -202,35 +309,6 @@ test "a condition selects exactly the entries whose flag is set" {
     for (no_zscript) |entry| try testing.expect(!std.mem.eql(u8, entry.dest, "zscript"));
 }
 
-test "the fingerprint satisfies the rule the toolchain validates" {
-    // The rule, restated from the compiler rather than trusted: the high half is the CRC and the
-    // low half is an id outside {0, 0xffffffff}. If a rendered zon is ever rejected, this is the
-    // test that should have caught it.
-    for ([_][]const u8{ "hello", "", "a-longer-project-name", "Zig", "x" }) |name| {
-        var buffer: [16]u8 = undefined;
-        const hex = fingerprint(name, &buffer);
-
-        try testing.expectEqual(@as(usize, 16), hex.len);
-        const value = try std.fmt.parseInt(u64, hex, 16);
-
-        const id: u32 = @truncate(value);
-        const checksum: u32 = @truncate(value >> 32);
-        try testing.expect(id != 0);
-        try testing.expect(id != 0xffffffff);
-        try testing.expectEqual(std.hash.Crc32.hash(name), checksum);
-    }
-
-    // Same input, same output: a generator that cannot be checked twice is a generator nobody
-    // can compare against a fix.
-    var a: [16]u8 = undefined;
-    var b: [16]u8 = undefined;
-    try testing.expectEqualStrings(fingerprint("hello", &a), fingerprint("hello", &b));
-
-    // And different names differ, or the checksum half is not doing its job.
-    var c: [16]u8 = undefined;
-    try testing.expect(!std.mem.eql(u8, fingerprint("hello", &a), fingerprint("world", &c)));
-}
-
 test "destinations are unique and relative" {
     for (entries, 0..) |entry, i| {
         try testing.expect(!std.mem.startsWith(u8, entry.dest, "/"));
@@ -238,6 +316,16 @@ test "destinations are unique and relative" {
         for (entries[i + 1 ..]) |other| {
             try testing.expect(!std.mem.eql(u8, entry.dest, other.dest));
         }
+    }
+}
+
+test "no entry writes the manifest, and none writes the library half of the example" {
+    // Both are the toolchain's: zig writes the zon (a fingerprint cannot be hardcoded) and
+    // `zig fetch --save` patches the dependency in. `src/root.zig` is deleted rather than
+    // overwritten, and templating it here would be a second source of truth.
+    for (entries) |entry| {
+        try testing.expect(!std.mem.eql(u8, entry.dest, "build.zig.zon"));
+        try testing.expect(!std.mem.eql(u8, entry.dest, "src/root.zig"));
     }
 }
 
